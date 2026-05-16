@@ -1,0 +1,231 @@
+<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>جسر شوبيفاي ↔ واتساب (joud.chat)</title>
+  <link rel="stylesheet" href="/style.css" />
+</head>
+<body>
+  <div class="app">
+    <header class="topbar">
+      <div class="brand">
+        <span class="logo">WA</span>
+        <div>
+          <h1>جسر شوبيفاي ↔ واتساب</h1>
+          <p class="sub" dir="ltr">Shopify orders → joud.chat WhatsApp templates</p>
+        </div>
+      </div>
+      <div class="status" id="statusBox">
+        <span class="dot" id="healthDot"></span>
+        <span id="healthText">جارٍ الفحص…</span>
+      </div>
+    </header>
+
+    <main>
+      <!-- 1. GENERATE ACCESS TOKEN (Shopify client-credentials) -->
+      <section class="card">
+        <h2><span class="num">1</span> ربط شوبيفاي — توليد رمز الوصول</h2>
+        <p class="hint">
+          بدون فتح شوبيفاي ولا متصفح: أدخل الدومين الفرعي للمتجر ومفاتيح
+          التطبيق (Client ID / Secret) ليتم توليد <b>Admin Access Token</b>
+          تلقائيًا (صلاحية 24 ساعة، يتجدّد ذاتيًا). ثم حمّل آخر أوردر حقيقي
+          لمراجعة ربط متغيرات القالب على بيانات فعلية.
+        </p>
+
+        <div class="shopify-status-bar">
+          <span class="dot" id="shopifyDot"></span>
+          <span id="shopifyStatusText">جارٍ فحص الاتصال…</span>
+          <span class="muted ltr" id="shopifyStatusMeta"></span>
+        </div>
+
+        <div class="grid" style="margin-top:14px">
+          <label>
+            الدومين الفرعي للمتجر (Store Sub-Domain)
+            <input id="shopSubDomain" type="text" dir="ltr"
+                   placeholder="for-you-shoe-6129" />
+          </label>
+          <label>
+            Client ID
+            <input id="shopClientId" type="text" dir="ltr"
+                   placeholder="اتركه فارغًا لاستخدام إعدادات .env" />
+          </label>
+          <label>
+            Client Secret
+            <input id="shopClientSecret" type="password" dir="ltr"
+                   placeholder="اتركه فارغًا لاستخدام إعدادات .env" />
+          </label>
+        </div>
+
+        <div class="row" style="margin-top:12px">
+          <button class="btn primary" id="generateToken">
+            🔑 توليد رمز الوصول / Generate Access Token
+          </button>
+          <button class="btn" id="loadLastOrder">تحميل آخر أوردر</button>
+        </div>
+
+        <div id="tokenResultBox" class="preview hidden">
+          <h3>تم توليد رمز الوصول بنجاح ✓</h3>
+          <div class="kv">
+            <b>ACCESS TOKEN</b>
+            <span class="ltr token-val">
+              <code id="genToken"></code>
+              <button class="btn ghost sm" id="copyToken">نسخ</button>
+            </span>
+          </div>
+          <div class="kv"><b>SCOPE</b><span class="ltr" id="genScope"></span></div>
+          <div class="kv"><b>EXPIRES IN</b><span class="ltr" id="genExpires"></span></div>
+          <p class="hint">
+            الرمز محفوظ في Supabase ويُستخدم تلقائيًا. الويب هوك يستقبل
+            الأوردرات ويرسل القالب دون أي خطوة يدوية إضافية.
+          </p>
+        </div>
+
+        <div id="lastOrderError" class="callout bad hidden" dir="auto"></div>
+
+        <div id="lastOrderBox" class="preview hidden">
+          <div class="order-summary" id="orderSummary" dir="auto"></div>
+
+          <h3>معاينة متغيرات القالب على الأوردر الحقيقي</h3>
+          <p class="hint" id="mappingSourceHint" dir="auto"></p>
+          <div class="table-wrap">
+            <table id="previewTable">
+              <thead>
+                <tr>
+                  <th>#</th>
+                  <th>متغير القالب</th>
+                  <th>الربط (Mapping)</th>
+                  <th>القيمة من الأوردر</th>
+                </tr>
+              </thead>
+              <tbody id="previewBody"></tbody>
+            </table>
+          </div>
+          <button class="btn primary" id="saveRealMapping" style="margin-top:14px">
+            حفظ الربط / Save mapping
+          </button>
+
+          <div class="test-last-order">
+            <h3>إرسال تجريبي ببيانات آخر أوردر</h3>
+            <p class="hint">
+              يرسل بيانات آخر أوردر حقيقي عبر القالب المحفوظ، لكن إلى الرقم
+              الذي تكتبه (بدلًا من رقم العميل) للتأكد من وصول الرسالة.
+            </p>
+            <div class="row">
+              <input id="testLastOrderPhone" type="text" dir="ltr"
+                     class="grow" placeholder="201029941259" />
+              <button class="btn primary" id="sendTestLastOrder">
+                إرسال إلى هذا الرقم
+              </button>
+            </div>
+            <pre id="testLastOrderResult" class="result hidden" dir="ltr"></pre>
+          </div>
+        </div>
+      </section>
+
+      <!-- 2. SETTINGS -->
+      <section class="card">
+        <h2><span class="num">2</span> الإعدادات</h2>
+        <p class="hint">إعدادات عامة للجسر. الحقول التقنية تظهر من اليسار لليمين.</p>
+        <div class="grid">
+          <label>
+            phone_number_id
+            <input id="phoneNumberId" type="text" dir="ltr" placeholder="1115965254927153" />
+          </label>
+          <label>
+            اسم المتجر (storeName)
+            <input id="storeName" type="text" placeholder="for-you-shoe" />
+          </label>
+          <label>
+            كود الدولة الافتراضي
+            <input id="countryCode" type="text" dir="ltr" placeholder="20" />
+          </label>
+          <label>
+            مصدر رقم هاتف العميل
+            <select id="phoneSource">
+              <option value="shipping">هاتف عنوان الشحن (الأفضل لهذا المتجر)</option>
+              <option value="customer">هاتف العميل</option>
+              <option value="billing">هاتف عنوان الفاتورة</option>
+              <option value="auto">تلقائي</option>
+            </select>
+          </label>
+        </div>
+        <button class="btn primary" id="saveSettings">حفظ الإعدادات</button>
+      </section>
+
+      <!-- 2. TEMPLATES -->
+      <section class="card">
+        <h2><span class="num">3</span> القوالب</h2>
+        <p class="hint">حمّل قوالب الرسائل من joud.chat واختر القالب المطلوب.</p>
+        <div class="row">
+          <button class="btn" id="loadTemplates">تحميل القوالب</button>
+          <select id="templateSelect" class="grow" dir="ltr">
+            <option value="">— لم يتم التحميل —</option>
+          </select>
+        </div>
+        <div id="templatePreview" class="preview hidden">
+          <h3>نص القالب</h3>
+          <pre id="templateBody" dir="auto"></pre>
+          <h3>المتغيرات المكتشفة</h3>
+          <div id="templateVars" class="chips"></div>
+        </div>
+      </section>
+
+      <!-- 3. MAPPING -->
+      <section class="card">
+        <h2><span class="num">4</span> ربط المتغيرات</h2>
+        <p class="hint">اربط كل متغير في القالب بحقل من طلب شوبيفاي، أو نص ثابت.</p>
+        <div id="mappingArea" class="mapping-area">
+          <p class="muted">اختر قالبًا أولًا لعرض متغيراته.</p>
+        </div>
+        <button class="btn primary" id="saveMapping" disabled>حفظ الربط</button>
+      </section>
+
+      <!-- 4. TEST SEND -->
+      <section class="card">
+        <h2><span class="num">5</span> إرسال تجريبي</h2>
+        <p class="hint">يرسل طلبًا تجريبيًا عبر نفس مسار الإرسال الحقيقي.</p>
+        <div class="row">
+          <input id="testPhone" type="text" dir="ltr" placeholder="رقم الهاتف بصيغة دولية، مثال 201001234567" class="grow" />
+          <button class="btn primary" id="sendTest">إرسال تجريبي</button>
+        </div>
+        <pre id="testResult" class="result hidden" dir="ltr"></pre>
+      </section>
+
+      <!-- 5. LOGS -->
+      <section class="card">
+        <div class="card-head">
+          <h2><span class="num">6</span> سجل الإرسال</h2>
+          <button class="btn ghost" id="refreshLogs">تحديث</button>
+        </div>
+        <div class="table-wrap">
+          <table id="logsTable">
+            <thead>
+              <tr>
+                <th>الوقت</th>
+                <th>الطلب</th>
+                <th>الهاتف</th>
+                <th>القالب</th>
+                <th>الحالة</th>
+                <th>الرد</th>
+              </tr>
+            </thead>
+            <tbody id="logsBody">
+              <tr><td colspan="6" class="muted">لا توجد سجلات بعد.</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+    </main>
+
+    <footer class="foot">
+      <span id="supabaseBadge" class="badge">…</span>
+      <span id="metaBadge" class="badge">…</span>
+      <span class="muted" dir="ltr" id="shopBadge"></span>
+    </footer>
+  </div>
+
+  <div id="toast" class="toast"></div>
+  <script src="/app.js"></script>
+</body>
+</html>
