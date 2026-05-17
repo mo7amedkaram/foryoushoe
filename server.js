@@ -15,6 +15,8 @@ import {
   saveConfig,
   insertLog,
   listLogs,
+  listLogsPaged,
+  successfulOrderIdSet,
   hasSuccessfulLog,
   findRecentOrderByPhone,
   getShopifyAuth,
@@ -48,6 +50,8 @@ import {
   confirmShopifyOrder,
   getOrderItemsDetailed,
   enrichOrderFromShopify,
+  adminApiGet,
+  CONFIRM_TAG,
   OAUTH_SCOPES,
 } from './src/shopifyOAuth.js';
 import { buildSampleOrder } from './src/sampleOrder.js';
@@ -264,13 +268,23 @@ const ADMIN_GUARDED = [
   ['POST', '/api/test-send'],
   ['POST', '/api/shopify/generate-token'],
   ['POST', '/api/shopify/test-last-order'],
+  ['POST', '/api/orders/send-all'],
+  // Per-order manual send: matched by prefix (the :id is dynamic) in
+  // the guard below, so it is intentionally NOT a static entry here.
+];
+// Dynamic guarded matcher for routes with a path param.
+const ADMIN_GUARDED_RE = [
+  // POST /api/orders/:id/send  (operator-triggered resend)
+  { method: 'POST', re: /^\/api\/orders\/[^/]+\/send$/ },
 ];
 app.use((req, res, next) => {
   const tok = config.security.adminUiToken;
   if (!tok) return next();
-  const guarded = ADMIN_GUARDED.some(
-    ([m, p]) => req.method === m && req.path === p
-  );
+  const guarded =
+    ADMIN_GUARDED.some(([m, p]) => req.method === m && req.path === p) ||
+    ADMIN_GUARDED_RE.some(
+      (g) => req.method === g.method && g.re.test(req.path)
+    );
   if (!guarded) return next();
   const got = req.get('x-admin-token') || req.query.admin_token || '';
   if (got && timingSafeStrEqual(String(got), tok)) return next();
@@ -373,13 +387,46 @@ app.get(
 );
 
 // ------------------------------------------------------------
-//  GET /api/logs?limit=
+//  GET /api/logs?page=&limit=&onlyFailed=1
+//
+//  Paginated, optionally error-filtered message log (the
+//  monitoring view). Backward compatible: when no `page` param is
+//  given it still returns the most recent `limit` rows (old shape
+//  plus the extra paging fields, which old callers ignore).
 // ------------------------------------------------------------
 app.get(
   '/api/logs',
   wrap(async (req, res) => {
-    const logs = await listLogs(req.query.limit || 50);
-    res.json({ ok: true, logs });
+    const limit = Math.min(
+      Math.max(parseInt(req.query.limit, 10) || 20, 1),
+      100
+    );
+    const onlyFailed =
+      req.query.onlyFailed === '1' ||
+      req.query.onlyFailed === 'true' ||
+      req.query.onlyFailed === true;
+
+    if (req.query.page === undefined && !onlyFailed) {
+      // Legacy behaviour: most recent `limit` rows.
+      const logs = await listLogs(limit);
+      return res.json({
+        ok: true,
+        logs,
+        page: 1,
+        limit,
+        total: logs.length,
+      });
+    }
+
+    const page = Math.max(parseInt(req.query.page, 10) || 1, 1);
+    const r = await listLogsPaged({ page, limit, onlyFailed });
+    res.json({
+      ok: true,
+      logs: r.rows,
+      page: r.page,
+      limit: r.limit,
+      total: r.total,
+    });
   })
 );
 
@@ -700,6 +747,282 @@ app.get(
       suggestedMapping,
       savedMapping: savedMapping || {},
       preview,
+    });
+  })
+);
+
+// ============================================================
+//  UNCONFIRMED ORDERS — list / send one / send all
+// ============================================================
+
+// The exact Shopify fields the unconfirmed list needs (kept small
+// to limit PII and payload size).
+const UNCONFIRMED_FIELDS =
+  'id,name,order_number,created_at,total_price,currency,' +
+  'financial_status,fulfillment_status,tags,customer,' +
+  'shipping_address,line_items';
+
+// Does this Shopify order already carry the confirm tag?
+// tags is a comma-separated string; compare case-insensitively.
+function hasConfirmTag(order) {
+  return String((order && order.tags) || '')
+    .split(',')
+    .map((t) => t.trim().toLowerCase())
+    .filter(Boolean)
+    .includes(CONFIRM_TAG.toLowerCase());
+}
+
+function isCancelledOrder(order) {
+  return Boolean(order && order.cancelled_at);
+}
+
+// Best-effort recipient phone for the list view (no normalization
+// here — just show what Shopify has so the operator can eyeball it).
+function listPhone(order) {
+  const sa = order && order.shipping_address;
+  const c = order && order.customer;
+  return (
+    (sa && sa.phone) ||
+    (c && c.phone) ||
+    (order && order.phone) ||
+    ''
+  );
+}
+
+function listCustomerName(order) {
+  const c = order && order.customer;
+  if (c && (c.first_name || c.last_name)) {
+    return `${c.first_name || ''} ${c.last_name || ''}`.trim();
+  }
+  const sa = order && order.shipping_address;
+  return (sa && sa.name) || '';
+}
+
+// Fetch recent Shopify orders, drop confirmed/cancelled ones, and
+// annotate each with `alreadySent` (a successful message_log row
+// exists for that shopify_order_id). Returns the FULL filtered list
+// (caller paginates / caps). Degrades gracefully to [] on error.
+async function computeUnconfirmedOrders() {
+  const result = await adminApiGet(
+    'orders.json?status=any&limit=250&order=created_at+desc&fields=' +
+      UNCONFIRMED_FIELDS
+  );
+  if (!result.ok) {
+    return {
+      ok: false,
+      error: result.error || 'FETCH_FAILED',
+      message: result.message || 'Could not fetch Shopify orders.',
+      status: result.status,
+      orders: [],
+    };
+  }
+  const raw = Array.isArray(result.data && result.data.orders)
+    ? result.data.orders
+    : [];
+
+  const filtered = raw.filter(
+    (o) => o && !hasConfirmTag(o) && !isCancelledOrder(o)
+  );
+
+  // One query -> Set of order ids that already have a successful send.
+  let sentSet = new Set();
+  try {
+    sentSet = await successfulOrderIdSet(2000);
+  } catch {
+    sentSet = new Set();
+  }
+
+  const orders = filtered.map((o) => ({
+    id: o.id,
+    name: o.name || `#${o.order_number || o.id}`,
+    order_number: o.order_number,
+    created_at: o.created_at,
+    total_price: o.total_price,
+    currency: o.currency,
+    customer_name: listCustomerName(o),
+    phone: listPhone(o),
+    alreadySent: sentSet.has(String(o.id)),
+  }));
+
+  return { ok: true, orders };
+}
+
+// ------------------------------------------------------------
+//  GET /api/orders/unconfirmed?limit=&page=
+//  Read-only (kept open, like the other /api/shopify/* reads).
+// ------------------------------------------------------------
+app.get(
+  '/api/orders/unconfirmed',
+  wrap(async (req, res) => {
+    const limit = Math.min(
+      Math.max(parseInt(req.query.limit, 10) || 20, 1),
+      100
+    );
+    const page = Math.max(parseInt(req.query.page, 10) || 1, 1);
+
+    const r = await computeUnconfirmedOrders();
+    if (!r.ok) {
+      const code =
+        r.error === 'NOT_CONNECTED'
+          ? 409
+          : r.status === 401 || r.status === 403
+          ? r.status
+          : 502;
+      return res.status(code).json({
+        ok: false,
+        error: r.error,
+        message: r.message,
+        page,
+        limit,
+        total: 0,
+        orders: [],
+      });
+    }
+
+    const total = r.orders.length;
+    const from = (page - 1) * limit;
+    const slice = r.orders.slice(from, from + limit);
+    res.json({
+      ok: true,
+      page,
+      limit,
+      total,
+      orders: slice,
+    });
+  })
+);
+
+// ------------------------------------------------------------
+//  POST /api/orders/:id/send   (ADMIN_GUARDED via regex)
+//  Operator-triggered (re)send for a single order. Bypasses
+//  idempotency on purpose (explicit operator intent to resend).
+// ------------------------------------------------------------
+app.post(
+  '/api/orders/:id/send',
+  wrap(async (req, res) => {
+    const id = String(req.params.id || '').trim();
+    if (!id) {
+      return res
+        .status(400)
+        .json({ ok: false, error: 'order id is required' });
+    }
+    const got = await fetchOrderById(id);
+    if (!got.ok) {
+      const code =
+        got.error === 'NOT_CONNECTED'
+          ? 409
+          : got.error === 'NOT_FOUND'
+          ? 404
+          : 502;
+      return res.status(code).json({
+        ok: false,
+        error: got.error || 'NOT_FOUND',
+        message: got.message || 'Could not fetch the order from Shopify.',
+      });
+    }
+    const result = await processOrder(got.order, {
+      source: 'manual-send',
+      skipIdempotency: true,
+    });
+    res.json({ ok: true, result });
+  })
+);
+
+// ------------------------------------------------------------
+//  POST /api/orders/send-all   (ADMIN_GUARDED)
+//  body (optional): { limit }
+//  Recompute the unconfirmed list, skip alreadySent, process
+//  sequentially with pacing, hard-capped at 50 per call. Never
+//  throws; one bad order does not abort the batch.
+// ------------------------------------------------------------
+const SEND_ALL_HARD_CAP = 50;
+const SEND_ALL_DELAY_MS = 400;
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+app.post(
+  '/api/orders/send-all',
+  wrap(async (req, res) => {
+    const body = req.body || {};
+    const reqLimit = parseInt(body.limit, 10);
+    const cap =
+      Number.isFinite(reqLimit) && reqLimit > 0
+        ? Math.min(reqLimit, SEND_ALL_HARD_CAP)
+        : SEND_ALL_HARD_CAP;
+
+    const r = await computeUnconfirmedOrders();
+    if (!r.ok) {
+      const code =
+        r.error === 'NOT_CONNECTED'
+          ? 409
+          : r.status === 401 || r.status === 403
+          ? r.status
+          : 502;
+      return res.status(code).json({
+        ok: false,
+        error: r.error,
+        message: r.message,
+        attempted: 0,
+        sent: 0,
+        failed: 0,
+        remaining: 0,
+        results: [],
+      });
+    }
+
+    // Only orders that have NOT been sent successfully yet.
+    const pending = r.orders.filter((o) => !o.alreadySent);
+    const batch = pending.slice(0, cap);
+    const remaining = Math.max(pending.length - batch.length, 0);
+
+    let sent = 0;
+    let failed = 0;
+    const results = [];
+
+    for (let i = 0; i < batch.length; i++) {
+      const item = batch[i];
+      try {
+        const got = await fetchOrderById(item.id);
+        if (!got.ok) {
+          failed += 1;
+          results.push({
+            order_number: item.order_number,
+            success: false,
+            response: `fetch failed: ${got.error || 'NOT_FOUND'}`,
+          });
+        } else {
+          // No skipIdempotency: processOrder's own idempotency +
+          // our alreadySent filter together prevent duplicates.
+          const out = await processOrder(got.order, {
+            source: 'send-all',
+          });
+          if (out && out.success) sent += 1;
+          else failed += 1;
+          results.push({
+            order_number:
+              (out && out.order_number) || item.order_number,
+            success: Boolean(out && out.success),
+            response: (out && out.response) || '',
+          });
+        }
+      } catch (err) {
+        failed += 1;
+        results.push({
+          order_number: item.order_number,
+          success: false,
+          response: `error: ${err.message}`,
+        });
+      }
+      // Pace between sends (Shopify ~2 req/s + WhatsApp pacing).
+      if (i < batch.length - 1) await sleep(SEND_ALL_DELAY_MS);
+    }
+
+    res.json({
+      ok: true,
+      attempted: batch.length,
+      sent,
+      failed,
+      remaining,
+      results,
     });
   })
 );

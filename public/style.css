@@ -193,6 +193,21 @@ td.ltr, .resp { direction: ltr; font-family: ui-monospace, Consolas, monospace; 
 #previewTable .map-controls input { min-width: 130px; width: auto; }
 #previewTable .empty-val { color: var(--muted); font-style: italic; }
 
+/* ---- Pager ---- */
+.pager {
+  display: flex; align-items: center; justify-content: center;
+  gap: 14px; margin-top: 14px; font-size: 13px;
+}
+.pager .btn.sm { padding: 6px 14px; }
+.inline-check {
+  flex-direction: row; align-items: center; gap: 8px;
+  font-size: 13.5px; cursor: pointer; user-select: none;
+}
+.inline-check input { width: auto; cursor: pointer; }
+tr.row-failed td { background: rgba(239,77,90,.08); }
+tr.row-failed td.resp { color: #ffb3ba; }
+td.actions { white-space: nowrap; }
+
 /* ---- Misc ---- */
 .muted { color: var(--muted); }
 .hidden { display: none; }

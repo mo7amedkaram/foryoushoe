@@ -181,6 +181,108 @@ export async function listLogs(limit = 50) {
 }
 
 // ------------------------------------------------------------
+//  listLogsPaged({ page, limit, onlyFailed }) ->
+//    { rows, total, page, limit }
+//
+//  Paginated message-log view used by the monitoring UI. Newest
+//  first; optional `onlyFailed` filter for error monitoring.
+//  Mirrors the in-memory fallback semantics exactly so the UI
+//  behaves the same in degraded mode.
+// ------------------------------------------------------------
+export async function listLogsPaged({ page = 1, limit = 20, onlyFailed = false } = {}) {
+  const p = Math.max(parseInt(page, 10) || 1, 1);
+  const n = Math.min(Math.max(parseInt(limit, 10) || 20, 1), 100);
+  const failedOnly = Boolean(onlyFailed);
+  const from = (p - 1) * n;
+  const to = from + n - 1;
+
+  if (!client) {
+    const all = failedOnly
+      ? memory.logs.filter((l) => l.success === false)
+      : memory.logs;
+    return {
+      rows: all.slice(from, from + n),
+      total: all.length,
+      page: p,
+      limit: n,
+    };
+  }
+  try {
+    let q = client
+      .from('message_log')
+      .select('*', { count: 'exact' })
+      .order('created_at', { ascending: false })
+      .range(from, to);
+    if (failedOnly) q = q.eq('success', false);
+    const { data, error, count } = await q;
+    if (error) throw error;
+    return {
+      rows: data || [],
+      total: typeof count === 'number' ? count : (data ? data.length : 0),
+      page: p,
+      limit: n,
+    };
+  } catch (err) {
+    console.warn('[supabase] listLogsPaged failed, using memory:', err.message);
+    const all = failedOnly
+      ? memory.logs.filter((l) => l.success === false)
+      : memory.logs;
+    return {
+      rows: all.slice(from, from + n),
+      total: all.length,
+      page: p,
+      limit: n,
+    };
+  }
+}
+
+// ------------------------------------------------------------
+//  successfulOrderIdSet(limit) -> Set<string>
+//
+//  One query that returns the set of shopify_order_id values that
+//  have at least one successful message_log row. Used to annotate
+//  the unconfirmed-orders list with `alreadySent` WITHOUT calling
+//  hasSuccessfulLog per order in a loop.
+// ------------------------------------------------------------
+export async function successfulOrderIdSet(limit = 1000) {
+  const n = Math.min(Math.max(parseInt(limit, 10) || 1000, 1), 5000);
+
+  if (!client) {
+    const set = new Set();
+    for (const l of memory.logs) {
+      if (l.success === true && l.shopify_order_id) {
+        set.add(String(l.shopify_order_id));
+      }
+    }
+    return set;
+  }
+  try {
+    const { data, error } = await client
+      .from('message_log')
+      .select('shopify_order_id')
+      .eq('success', true)
+      .not('shopify_order_id', 'is', null)
+      .order('created_at', { ascending: false })
+      .limit(n);
+    if (error) throw error;
+    const set = new Set();
+    for (const r of data || []) {
+      if (r && r.shopify_order_id) set.add(String(r.shopify_order_id));
+    }
+    return set;
+  } catch (err) {
+    console.warn('[supabase] successfulOrderIdSet failed, using memory:', err.message);
+    const set = new Set();
+    for (const l of memory.logs) {
+      if (l.success === true && l.shopify_order_id) {
+        set.add(String(l.shopify_order_id));
+      }
+    }
+    return set;
+  }
+}
+
+// ------------------------------------------------------------
 //  hasSuccessfulLog(orderId, templateId) -> boolean
 //  Best-effort idempotency check.
 // ------------------------------------------------------------
@@ -332,6 +434,8 @@ export default {
   saveConfig,
   insertLog,
   listLogs,
+  listLogsPaged,
+  successfulOrderIdSet,
   hasSuccessfulLog,
   findRecentOrderByPhone,
   getShopifyAuth,

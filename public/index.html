@@ -192,11 +192,76 @@
         <pre id="testResult" class="result hidden" dir="ltr"></pre>
       </section>
 
-      <!-- 5. LOGS -->
+      <!-- 6. UNCONFIRMED ORDERS -->
       <section class="card">
         <div class="card-head">
-          <h2><span class="num">6</span> سجل الإرسال</h2>
+          <h2><span class="num">6</span> 📋 الطلبات غير المؤكدة</h2>
+          <button class="btn ghost" id="loadUnconfirmed">
+            تحميل الطلبات غير المؤكدة
+          </button>
+        </div>
+        <p class="hint">
+          الطلبات التي لم تُوسَم بعد بـ «WhatsApp Confirmed» (وغير الملغاة).
+          يمكنك إرسال رسالة التأكيد لطلب واحد، أو دفعة كاملة. الإرسال للكل
+          يتخطّى الطلبات التي سبق إرسالها بنجاح، ويُرسل بحدّ أقصى 50 طلبًا
+          في كل مرة بتباعد بسيط بين الرسائل.
+        </p>
+
+        <div class="row" style="margin-bottom:12px">
+          <button class="btn primary" id="sendAllUnconfirmed">
+            إرسال للكل (غير المؤكدة)
+          </button>
+          <button class="btn hidden" id="sendNextBatch">
+            إرسال الدفعة التالية
+          </button>
+          <span class="muted" id="unconfirmedMeta"></span>
+        </div>
+
+        <div id="unconfirmedError" class="callout bad hidden" dir="auto"></div>
+
+        <div class="table-wrap">
+          <table id="unconfirmedTable">
+            <thead>
+              <tr>
+                <th>رقم الأوردر</th>
+                <th>العميل</th>
+                <th>الهاتف</th>
+                <th>الإجمالي</th>
+                <th>التاريخ</th>
+                <th>حالة الإرسال</th>
+                <th>إجراء</th>
+              </tr>
+            </thead>
+            <tbody id="unconfirmedBody">
+              <tr><td colspan="7" class="muted">
+                اضغط «تحميل الطلبات غير المؤكدة» للعرض.
+              </td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="pager" id="unconfirmedPager">
+          <button class="btn ghost sm" id="ucPrev" disabled>‹ السابق</button>
+          <span class="muted" id="ucPageInfo">—</span>
+          <button class="btn ghost sm" id="ucNext" disabled>التالي ›</button>
+        </div>
+      </section>
+
+      <!-- 7. LOGS / MONITORING -->
+      <section class="card">
+        <div class="card-head">
+          <h2><span class="num">7</span> سجل الإرسال / المراقبة</h2>
           <button class="btn ghost" id="refreshLogs">تحديث</button>
+        </div>
+        <p class="hint">
+          كل عمليات الإرسال والردود الواردة. فعّل «أخطاء فقط» لمراقبة
+          الرسائل الفاشلة فقط مع نص الخطأ الكامل.
+        </p>
+        <div class="row" style="margin-bottom:10px">
+          <label class="inline-check">
+            <input type="checkbox" id="logsOnlyFailed" />
+            أخطاء فقط
+          </label>
         </div>
         <div class="table-wrap">
           <table id="logsTable">
@@ -214,6 +279,11 @@
               <tr><td colspan="6" class="muted">لا توجد سجلات بعد.</td></tr>
             </tbody>
           </table>
+        </div>
+        <div class="pager" id="logsPager">
+          <button class="btn ghost sm" id="logsPrev" disabled>‹ السابق</button>
+          <span class="muted" id="logsPageInfo">—</span>
+          <button class="btn ghost sm" id="logsNext" disabled>التالي ›</button>
         </div>
       </section>
     </main>

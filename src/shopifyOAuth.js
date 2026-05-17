@@ -677,7 +677,7 @@ export async function fetchOrderById(orderId) {
 //  confirmShopifyOrder(orderId) — marks the order confirmed by
 //  adding a tag (and a note). Requires write_orders (granted).
 // ------------------------------------------------------------
-const CONFIRM_TAG = 'WhatsApp Confirmed';
+export const CONFIRM_TAG = 'WhatsApp Confirmed';
 
 export async function confirmShopifyOrder(orderId) {
   const got = await fetchOrderById(orderId);
@@ -771,6 +771,7 @@ export default {
   getOrderItemsDetailed,
   fetchProductImageUrl,
   enrichOrderFromShopify,
+  CONFIRM_TAG,
   OAUTH_SCOPES,
   ADMIN_API_VERSION,
 };

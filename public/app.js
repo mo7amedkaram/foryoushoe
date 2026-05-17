@@ -341,38 +341,277 @@
     }
   });
 
-  // ---- logs ----
-  $('refreshLogs').addEventListener('click', loadLogs);
+  // ---- logs / monitoring (paginated + error filter) ----
+  const LOGS_LIMIT = 20;
+  let logsPage = 1;
+  let logsTotal = 0;
+
+  $('refreshLogs').addEventListener('click', () => {
+    logsPage = 1;
+    loadLogs();
+  });
+  $('logsOnlyFailed').addEventListener('change', () => {
+    logsPage = 1;
+    loadLogs();
+  });
+  $('logsPrev').addEventListener('click', () => {
+    if (logsPage > 1) {
+      logsPage -= 1;
+      loadLogs();
+    }
+  });
+  $('logsNext').addEventListener('click', () => {
+    const pages = Math.max(Math.ceil(logsTotal / LOGS_LIMIT), 1);
+    if (logsPage < pages) {
+      logsPage += 1;
+      loadLogs();
+    }
+  });
 
   async function loadLogs() {
+    const onlyFailed = $('logsOnlyFailed').checked;
     try {
-      const r = await api('/api/logs?limit=50');
+      const qs =
+        `/api/logs?page=${logsPage}&limit=${LOGS_LIMIT}` +
+        (onlyFailed ? '&onlyFailed=1' : '');
+      const r = await api(qs);
       const body = $('logsBody');
       const logs = r.logs || [];
+      logsTotal = typeof r.total === 'number' ? r.total : logs.length;
+      logsPage = r.page || logsPage;
+
       if (logs.length === 0) {
-        body.innerHTML = '<tr><td colspan="6" class="muted">لا توجد سجلات بعد.</td></tr>';
-        return;
+        body.innerHTML =
+          '<tr><td colspan="6" class="muted">' +
+          (onlyFailed ? 'لا توجد رسائل فاشلة 🎉' : 'لا توجد سجلات بعد.') +
+          '</td></tr>';
+      } else {
+        body.innerHTML = logs
+          .map((l) => {
+            const t = l.created_at
+              ? new Date(l.created_at).toLocaleString()
+              : '';
+            const ok = l.success
+              ? '<span class="pill ok">نجح</span>'
+              : '<span class="pill bad">فشل</span>';
+            const rowCls = l.success ? '' : ' class="row-failed"';
+            return `<tr${rowCls}>
+              <td class="ltr">${esc(t)}</td>
+              <td class="ltr">${esc(l.order_number || l.shopify_order_id || '')}</td>
+              <td class="ltr">${esc(l.recipient_phone || '')}</td>
+              <td class="ltr">${esc(l.template_id || '')}</td>
+              <td>${ok}</td>
+              <td class="resp">${esc((l.response || '').slice(0, 800))}</td>
+            </tr>`;
+          })
+          .join('');
       }
-      body.innerHTML = logs
-        .map((l) => {
-          const t = l.created_at ? new Date(l.created_at).toLocaleString() : '';
-          const ok = l.success
-            ? '<span class="pill ok">نجح</span>'
-            : '<span class="pill bad">فشل</span>';
-          return `<tr>
-            <td class="ltr">${esc(t)}</td>
-            <td class="ltr">${esc(l.order_number || l.shopify_order_id || '')}</td>
-            <td class="ltr">${esc(l.recipient_phone || '')}</td>
-            <td class="ltr">${esc(l.template_id || '')}</td>
-            <td>${ok}</td>
-            <td class="resp">${esc((l.response || '').slice(0, 400))}</td>
-          </tr>`;
-        })
-        .join('');
+      updateLogsPager();
     } catch (e) {
       toast('فشل تحميل السجلات: ' + e.message, 'bad');
     }
   }
+
+  function updateLogsPager() {
+    const pages = Math.max(Math.ceil(logsTotal / LOGS_LIMIT), 1);
+    $('logsPageInfo').textContent =
+      `صفحة ${logsPage} من ${pages} · إجمالي ${logsTotal}`;
+    $('logsPrev').disabled = logsPage <= 1;
+    $('logsNext').disabled = logsPage >= pages;
+  }
+
+  // ============================================================
+  //  Unconfirmed orders — list / send one / send all
+  // ============================================================
+  const UC_LIMIT = 20;
+  let ucPage = 1;
+  let ucTotal = 0;
+  let ucLoaded = false;
+
+  $('loadUnconfirmed').addEventListener('click', () => {
+    ucPage = 1;
+    loadUnconfirmed();
+  });
+  $('ucPrev').addEventListener('click', () => {
+    if (ucPage > 1) {
+      ucPage -= 1;
+      loadUnconfirmed();
+    }
+  });
+  $('ucNext').addEventListener('click', () => {
+    const pages = Math.max(Math.ceil(ucTotal / UC_LIMIT), 1);
+    if (ucPage < pages) {
+      ucPage += 1;
+      loadUnconfirmed();
+    }
+  });
+
+  function updateUcPager() {
+    const pages = Math.max(Math.ceil(ucTotal / UC_LIMIT), 1);
+    $('ucPageInfo').textContent = ucLoaded
+      ? `صفحة ${ucPage} من ${pages} · إجمالي ${ucTotal}`
+      : '—';
+    $('ucPrev').disabled = !ucLoaded || ucPage <= 1;
+    $('ucNext').disabled = !ucLoaded || ucPage >= pages;
+  }
+
+  async function loadUnconfirmed() {
+    const btn = $('loadUnconfirmed');
+    btn.disabled = true;
+    btn.textContent = 'جارٍ التحميل…';
+    $('unconfirmedError').classList.add('hidden');
+    try {
+      const r = await api(
+        `/api/orders/unconfirmed?page=${ucPage}&limit=${UC_LIMIT}`
+      );
+      ucLoaded = true;
+      ucTotal = typeof r.total === 'number' ? r.total : 0;
+      ucPage = r.page || ucPage;
+      renderUnconfirmed(r.orders || []);
+      updateUcPager();
+      toast(`تم تحميل ${ucTotal} طلب غير مؤكد`, 'ok');
+    } catch (e) {
+      const box = $('unconfirmedError');
+      box.textContent = 'تعذّر تحميل الطلبات غير المؤكدة: ' + e.message;
+      box.classList.remove('hidden');
+      toast('تعذّر تحميل الطلبات', 'bad');
+    } finally {
+      btn.disabled = false;
+      btn.textContent = 'تحميل الطلبات غير المؤكدة';
+    }
+  }
+
+  function renderUnconfirmed(orders) {
+    const body = $('unconfirmedBody');
+    if (!orders.length) {
+      body.innerHTML =
+        '<tr><td colspan="7" class="muted">لا توجد طلبات غير مؤكدة 🎉</td></tr>';
+      return;
+    }
+    body.innerHTML = '';
+    orders.forEach((o) => {
+      const tr = document.createElement('tr');
+      const created = o.created_at
+        ? new Date(o.created_at).toLocaleString()
+        : '';
+      const sent = o.alreadySent
+        ? '<span class="pill ok">اتبعت</span>'
+        : '<span class="pill bad">لسه</span>';
+      tr.innerHTML =
+        `<td class="ltr">${esc(o.name || o.order_number || o.id)}</td>` +
+        `<td dir="auto">${esc(o.customer_name || '')}</td>` +
+        `<td class="ltr">${esc(o.phone || '')}</td>` +
+        `<td class="ltr">${esc(
+          `${o.total_price || ''} ${o.currency || ''}`.trim()
+        )}</td>` +
+        `<td class="ltr">${esc(created)}</td>` +
+        `<td>${sent}</td>` +
+        `<td class="actions"></td>`;
+      const actionTd = tr.querySelector('td.actions');
+      const sendBtn = document.createElement('button');
+      sendBtn.className = 'btn primary sm';
+      sendBtn.textContent = 'إرسال';
+      sendBtn.addEventListener('click', () =>
+        sendOneOrder(o, sendBtn, tr)
+      );
+      actionTd.appendChild(sendBtn);
+      body.appendChild(tr);
+    });
+  }
+
+  async function sendOneOrder(order, btn, tr) {
+    btn.disabled = true;
+    const original = btn.textContent;
+    btn.textContent = '… جارٍ الإرسال';
+    try {
+      const r = await api(
+        `/api/orders/${encodeURIComponent(order.id)}/send`,
+        { method: 'POST' }
+      );
+      const ok = r.result && r.result.success;
+      if (ok) {
+        const cell = tr.children[5];
+        if (cell) cell.innerHTML = '<span class="pill ok">اتبعت</span>';
+        btn.textContent = 'تم ✓';
+        toast(
+          `تم إرسال التأكيد للأوردر ${order.name || order.order_number}`,
+          'ok'
+        );
+      } else {
+        btn.disabled = false;
+        btn.textContent = original;
+        toast(
+          'لم ينجح الإرسال: ' +
+            ((r.result && r.result.response) || 'راجع السجل'),
+          'bad'
+        );
+      }
+      loadLogs();
+    } catch (e) {
+      btn.disabled = false;
+      btn.textContent = original;
+      toast('فشل الإرسال: ' + e.message, 'bad');
+    }
+  }
+
+  async function runSendAll(btn) {
+    const original = btn.textContent;
+    btn.disabled = true;
+    btn.textContent = 'جارٍ الإرسال للكل…';
+    $('unconfirmedError').classList.add('hidden');
+    try {
+      const r = await api('/api/orders/send-all', { method: 'POST' });
+      const summary =
+        `تمت محاولة ${r.attempted} — نجح ${r.sent} · فشل ${r.failed}` +
+        (r.remaining > 0 ? ` · متبقّي ${r.remaining}` : '');
+      $('unconfirmedMeta').textContent = summary;
+      toast(
+        summary,
+        r.failed === 0 && r.attempted > 0
+          ? 'ok'
+          : r.attempted === 0
+          ? ''
+          : 'bad'
+      );
+      // Surface per-order failures inline for monitoring.
+      const fails = (r.results || []).filter((x) => !x.success);
+      if (fails.length) {
+        const box = $('unconfirmedError');
+        box.textContent =
+          'طلبات لم تُرسل:\n' +
+          fails
+            .map(
+              (x) =>
+                `#${x.order_number || '?'} :: ${(x.response || '').slice(
+                  0,
+                  300
+                )}`
+            )
+            .join('\n');
+        box.classList.remove('hidden');
+      }
+      // Offer the next batch if Shopify still has more pending.
+      const nextBtn = $('sendNextBatch');
+      if (r.remaining > 0) nextBtn.classList.remove('hidden');
+      else nextBtn.classList.add('hidden');
+      // Refresh the list + logs to reflect new sends.
+      ucPage = 1;
+      await loadUnconfirmed();
+      loadLogs();
+    } catch (e) {
+      toast('فشل الإرسال للكل: ' + e.message, 'bad');
+    } finally {
+      btn.disabled = false;
+      btn.textContent = original;
+    }
+  }
+
+  $('sendAllUnconfirmed').addEventListener('click', () =>
+    runSendAll($('sendAllUnconfirmed'))
+  );
+  $('sendNextBatch').addEventListener('click', () =>
+    runSendAll($('sendNextBatch'))
+  );
 
   // ============================================================
   //  Shopify OAuth connect + real last-order preview
