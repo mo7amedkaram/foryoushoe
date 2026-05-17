@@ -217,6 +217,14 @@
           <span class="muted" id="unconfirmedMeta"></span>
         </div>
 
+        <div class="status-filter" id="ucStatusFilter">
+          <span class="sf-label">تصفية حسب الحالة:</span>
+          <button class="sf-btn active" data-status="">الكل (غير المؤكدة)</button>
+          <button class="sf-btn" data-status="pending">⏳ بانتظار التأكيد</button>
+          <button class="sf-btn" data-status="cancelled">✗ ملغي</button>
+          <button class="sf-btn" data-status="confirmed">✓ مؤكد</button>
+        </div>
+
         <div id="unconfirmedError" class="callout bad hidden" dir="auto"></div>
 
         <div class="table-wrap">
@@ -228,12 +236,13 @@
                 <th>الهاتف</th>
                 <th>الإجمالي</th>
                 <th>التاريخ</th>
+                <th>حالة الطلب</th>
                 <th>حالة الإرسال</th>
                 <th>إجراء</th>
               </tr>
             </thead>
             <tbody id="unconfirmedBody">
-              <tr><td colspan="7" class="muted">
+              <tr><td colspan="8" class="muted">
                 اضغط «تحميل الطلبات غير المؤكدة» للعرض.
               </td></tr>
             </tbody>
@@ -271,12 +280,13 @@
                 <th>الطلب</th>
                 <th>الهاتف</th>
                 <th>القالب</th>
+                <th>حالة الطلب</th>
                 <th>الحالة</th>
                 <th>الرد</th>
               </tr>
             </thead>
             <tbody id="logsBody">
-              <tr><td colspan="6" class="muted">لا توجد سجلات بعد.</td></tr>
+              <tr><td colspan="7" class="muted">لا توجد سجلات بعد.</td></tr>
             </tbody>
           </table>
         </div>

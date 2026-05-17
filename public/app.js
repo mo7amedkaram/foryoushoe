@@ -77,6 +77,45 @@
       .replace(/>/g, '&gt;').replace(/"/g, '&quot;');
   }
 
+  // ---- order status badge (soft, eye-comfortable, RTL) ----
+  // status: 'confirmed' | 'cancelled' | 'pending' | 'none' | undefined
+  const STATUS_BADGES = {
+    confirmed: { cls: 'is-confirmed', ico: '✓', label: 'مؤكد' },
+    cancelled: { cls: 'is-cancelled', ico: '✗', label: 'ملغي' },
+    pending:   { cls: 'is-pending',   ico: '⏳', label: 'بانتظار التأكيد' },
+    none:      { cls: 'is-none',      ico: '—', label: 'لم تُرسل' },
+  };
+  function statusBadge(status) {
+    const s = STATUS_BADGES[status] || STATUS_BADGES.none;
+    return (
+      `<span class="status-badge ${s.cls}">` +
+      `<span class="ico">${esc(s.ico)}</span>${esc(s.label)}</span>`
+    );
+  }
+  // Best-effort order-status for a message_log row. The logs API
+  // does not carry Shopify tags, so we infer from what the row
+  // represents: an inbound confirm/cancel tap, or a successful
+  // outbound order send (which marks the order Pending server-side).
+  // Returns one of confirmed|cancelled|pending, or '' (-> muted —).
+  function logRowStatus(l) {
+    if (!l || !l.success) return '';
+    const v = (l && l.variables) || {};
+    const action = String(v.action || '').toLowerCase();
+    if (action === 'confirm') return 'confirmed';
+    if (action === 'cancel') return 'cancelled';
+    // An order send (real Shopify order id, not an inbound action,
+    // and not a status-callback/webhook-only row) -> Pending.
+    if (
+      !action &&
+      l.shopify_order_id &&
+      /^\d+$/.test(String(l.shopify_order_id)) &&
+      l.template_id
+    ) {
+      return 'pending';
+    }
+    return '';
+  }
+
   // ---- health ----
   async function loadHealth() {
     try {
@@ -382,7 +421,7 @@
 
       if (logs.length === 0) {
         body.innerHTML =
-          '<tr><td colspan="6" class="muted">' +
+          '<tr><td colspan="7" class="muted">' +
           (onlyFailed ? 'لا توجد رسائل فاشلة 🎉' : 'لا توجد سجلات بعد.') +
           '</td></tr>';
       } else {
@@ -395,11 +434,14 @@
               ? '<span class="pill ok">نجح</span>'
               : '<span class="pill bad">فشل</span>';
             const rowCls = l.success ? '' : ' class="row-failed"';
+            const st = logRowStatus(l);
+            const stCell = st ? statusBadge(st) : '<span class="muted">—</span>';
             return `<tr${rowCls}>
               <td class="ltr">${esc(t)}</td>
               <td class="ltr">${esc(l.order_number || l.shopify_order_id || '')}</td>
               <td class="ltr">${esc(l.recipient_phone || '')}</td>
               <td class="ltr">${esc(l.template_id || '')}</td>
+              <td>${stCell}</td>
               <td>${ok}</td>
               <td class="resp">${esc((l.response || '').slice(0, 800))}</td>
             </tr>`;
@@ -427,8 +469,21 @@
   let ucPage = 1;
   let ucTotal = 0;
   let ucLoaded = false;
+  let ucStatus = ''; // '' (default: pending+none) | pending | cancelled | confirmed
 
   $('loadUnconfirmed').addEventListener('click', () => {
+    ucPage = 1;
+    loadUnconfirmed();
+  });
+
+  // Status filter buttons -> reload with ?status=
+  $('ucStatusFilter').addEventListener('click', (e) => {
+    const btn = e.target.closest('.sf-btn');
+    if (!btn) return;
+    ucStatus = btn.dataset.status || '';
+    document
+      .querySelectorAll('#ucStatusFilter .sf-btn')
+      .forEach((b) => b.classList.toggle('active', b === btn));
     ucPage = 1;
     loadUnconfirmed();
   });
@@ -462,14 +517,15 @@
     $('unconfirmedError').classList.add('hidden');
     try {
       const r = await api(
-        `/api/orders/unconfirmed?page=${ucPage}&limit=${UC_LIMIT}`
+        `/api/orders/unconfirmed?page=${ucPage}&limit=${UC_LIMIT}` +
+          (ucStatus ? `&status=${encodeURIComponent(ucStatus)}` : '')
       );
       ucLoaded = true;
       ucTotal = typeof r.total === 'number' ? r.total : 0;
       ucPage = r.page || ucPage;
       renderUnconfirmed(r.orders || []);
       updateUcPager();
-      toast(`تم تحميل ${ucTotal} طلب غير مؤكد`, 'ok');
+      toast(`تم تحميل ${ucTotal} طلب`, 'ok');
     } catch (e) {
       const box = $('unconfirmedError');
       box.textContent = 'تعذّر تحميل الطلبات غير المؤكدة: ' + e.message;
@@ -484,8 +540,11 @@
   function renderUnconfirmed(orders) {
     const body = $('unconfirmedBody');
     if (!orders.length) {
+      const emptyMsg = ucStatus
+        ? 'لا توجد طلبات بهذه الحالة'
+        : 'لا توجد طلبات غير مؤكدة 🎉';
       body.innerHTML =
-        '<tr><td colspan="7" class="muted">لا توجد طلبات غير مؤكدة 🎉</td></tr>';
+        `<tr><td colspan="8" class="muted">${esc(emptyMsg)}</td></tr>`;
       return;
     }
     body.innerHTML = '';
@@ -505,6 +564,7 @@
           `${o.total_price || ''} ${o.currency || ''}`.trim()
         )}</td>` +
         `<td class="ltr">${esc(created)}</td>` +
+        `<td>${statusBadge(o.status)}</td>` +
         `<td>${sent}</td>` +
         `<td class="actions"></td>`;
       const actionTd = tr.querySelector('td.actions');
@@ -530,8 +590,14 @@
       );
       const ok = r.result && r.result.success;
       if (ok) {
-        const cell = tr.children[5];
+        // index 6 = "حالة الإرسال" (already-sent pill); index 5 is
+        // now the order-status badge.
+        const cell = tr.children[6];
         if (cell) cell.innerHTML = '<span class="pill ok">اتبعت</span>';
+        // The send marks the order Pending Confirmation server-side;
+        // reflect that in the status badge cell immediately.
+        const stCell = tr.children[5];
+        if (stCell) stCell.innerHTML = statusBadge('pending');
         btn.textContent = 'تم ✓';
         toast(
           `تم إرسال التأكيد للأوردر ${order.name || order.order_number}`,

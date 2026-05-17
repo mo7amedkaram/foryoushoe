@@ -48,10 +48,14 @@ import {
   fetchLatestOrder,
   fetchOrderById,
   confirmShopifyOrder,
+  cancelShopifyOrder,
+  markOrderPending,
   getOrderItemsDetailed,
   enrichOrderFromShopify,
   adminApiGet,
   CONFIRM_TAG,
+  PENDING_TAG,
+  CANCEL_TAG,
   OAUTH_SCOPES,
 } from './src/shopifyOAuth.js';
 import { buildSampleOrder } from './src/sampleOrder.js';
@@ -762,18 +766,24 @@ const UNCONFIRMED_FIELDS =
   'financial_status,fulfillment_status,tags,customer,' +
   'shipping_address,line_items';
 
-// Does this Shopify order already carry the confirm tag?
+// Derive the WhatsApp lifecycle status from an order's tags.
 // tags is a comma-separated string; compare case-insensitively.
-function hasConfirmTag(order) {
-  return String((order && order.tags) || '')
+// Precedence: confirmed > cancelled > pending > none (the three
+// status tags are mutually exclusive in practice, but precedence
+// makes the result deterministic even if an order somehow has
+// more than one). A Shopify-cancelled order (cancelled_at) is
+// treated as 'cancelled' too.
+function deriveOrderStatus(order) {
+  const tags = String((order && order.tags) || '')
     .split(',')
     .map((t) => t.trim().toLowerCase())
-    .filter(Boolean)
-    .includes(CONFIRM_TAG.toLowerCase());
-}
-
-function isCancelledOrder(order) {
-  return Boolean(order && order.cancelled_at);
+    .filter(Boolean);
+  if (tags.includes(CONFIRM_TAG.toLowerCase())) return 'confirmed';
+  if (tags.includes(CANCEL_TAG.toLowerCase()) || (order && order.cancelled_at)) {
+    return 'cancelled';
+  }
+  if (tags.includes(PENDING_TAG.toLowerCase())) return 'pending';
+  return 'none';
 }
 
 // Best-effort recipient phone for the list view (no normalization
@@ -798,11 +808,22 @@ function listCustomerName(order) {
   return (sa && sa.name) || '';
 }
 
-// Fetch recent Shopify orders, drop confirmed/cancelled ones, and
+// Valid values for the optional ?status= filter.
+const ORDER_STATUS_VALUES = ['pending', 'cancelled', 'confirmed', 'none', 'all'];
+
+// Fetch recent Shopify orders, derive each order's WhatsApp
+// lifecycle status from its tags, filter by `statusFilter`, and
 // annotate each with `alreadySent` (a successful message_log row
 // exists for that shopify_order_id). Returns the FULL filtered list
 // (caller paginates / caps). Degrades gracefully to [] on error.
-async function computeUnconfirmedOrders() {
+//
+// statusFilter:
+//   undefined/'' -> default: NOT confirmed AND NOT cancelled
+//                   (i.e. 'pending' or 'none') — the classic
+//                   "unconfirmed" list, now also excluding cancelled.
+//   'pending' | 'cancelled' | 'confirmed' | 'none' -> just that subset
+//   'all'        -> every order, with its derived status
+async function computeUnconfirmedOrders(statusFilter) {
   const result = await adminApiGet(
     'orders.json?status=any&limit=250&order=created_at+desc&fields=' +
       UNCONFIRMED_FIELDS
@@ -820,9 +841,26 @@ async function computeUnconfirmedOrders() {
     ? result.data.orders
     : [];
 
-  const filtered = raw.filter(
-    (o) => o && !hasConfirmTag(o) && !isCancelledOrder(o)
-  );
+  const wanted =
+    typeof statusFilter === 'string' &&
+    ORDER_STATUS_VALUES.includes(statusFilter)
+      ? statusFilter
+      : '';
+
+  const annotated = raw
+    .filter((o) => o && typeof o === 'object')
+    .map((o) => ({ o, status: deriveOrderStatus(o) }));
+
+  const filtered = annotated.filter(({ status }) => {
+    if (wanted === 'all') return true;
+    if (wanted === 'pending') return status === 'pending';
+    if (wanted === 'cancelled') return status === 'cancelled';
+    if (wanted === 'confirmed') return status === 'confirmed';
+    if (wanted === 'none') return status === 'none';
+    // Default (no/invalid filter): the classic unconfirmed list —
+    // exclude confirmed AND cancelled (pending + none remain).
+    return status !== 'confirmed' && status !== 'cancelled';
+  });
 
   // One query -> Set of order ids that already have a successful send.
   let sentSet = new Set();
@@ -832,7 +870,7 @@ async function computeUnconfirmedOrders() {
     sentSet = new Set();
   }
 
-  const orders = filtered.map((o) => ({
+  const orders = filtered.map(({ o, status }) => ({
     id: o.id,
     name: o.name || `#${o.order_number || o.id}`,
     order_number: o.order_number,
@@ -841,6 +879,7 @@ async function computeUnconfirmedOrders() {
     currency: o.currency,
     customer_name: listCustomerName(o),
     phone: listPhone(o),
+    status,
     alreadySent: sentSet.has(String(o.id)),
   }));
 
@@ -859,8 +898,12 @@ app.get(
       100
     );
     const page = Math.max(parseInt(req.query.page, 10) || 1, 1);
+    const rawStatus = String(req.query.status || '').trim().toLowerCase();
+    const statusFilter = ORDER_STATUS_VALUES.includes(rawStatus)
+      ? rawStatus
+      : '';
 
-    const r = await computeUnconfirmedOrders();
+    const r = await computeUnconfirmedOrders(statusFilter);
     if (!r.ok) {
       const code =
         r.error === 'NOT_CONNECTED'
@@ -872,6 +915,7 @@ app.get(
         ok: false,
         error: r.error,
         message: r.message,
+        status: statusFilter || 'default',
         page,
         limit,
         total: 0,
@@ -884,6 +928,7 @@ app.get(
     const slice = r.orders.slice(from, from + limit);
     res.json({
       ok: true,
+      status: statusFilter || 'default',
       page,
       limit,
       total,
@@ -1258,7 +1303,26 @@ async function processOrder(
     response: `[${source}] HTTP ${sendResult.httpStatus} :: ${sendResult.raw}`,
   };
   await insertLog(rec);
+
+  // After a SUCCESSFUL WhatsApp send, best-effort tag the Shopify
+  // order as "Pending Confirmation" (only if it has no final state).
+  // Runs AFTER the log path and is fully guarded so it can never
+  // block or fail the send. Skipped for synthetic test ids (e.g.
+  // "TEST-1700000000000") which are not real Shopify orders.
+  if (sendResult.success && isRealShopifyOrderId(order.id)) {
+    try {
+      await markOrderPending(order.id);
+    } catch {
+      /* best effort — never affects the send result */
+    }
+  }
   return rec;
+}
+
+// A real Shopify order id is a positive integer (the sample/test
+// order uses a synthetic string id like "TEST-1700000000000").
+function isRealShopifyOrderId(id) {
+  return /^\d+$/.test(String(id == null ? '' : id).trim());
 }
 
 // ------------------------------------------------------------
@@ -1599,11 +1663,31 @@ async function processInboundWhatsAppMessage(msg) {
     return;
   }
 
-  // ---- Cancel / other: acknowledge only ----
+  // ---- Cancel order ----
   if (/الغاء|إلغاء|cancel/i.test(label)) {
+    if (!orderId) {
+      await metaSendText({
+        to: from,
+        text: 'لم نتمكن من ربط رقمك بطلب حديث. تواصل معنا من فضلك 🙏',
+      });
+      await insertLog({
+        shopify_order_id: null,
+        order_number: null,
+        recipient_phone: from,
+        template_id: null,
+        variables: { action: 'cancel', button: label },
+        success: false,
+        response: '[inbound] cancel -> no recent order linked to phone',
+      });
+      return;
+    }
+    const r = await cancelShopifyOrder(orderId);
+    const ok = r && r.ok;
     await metaSendText({
       to: from,
-      text: 'تم استلام طلب الإلغاء، فريق خدمة العملاء هيتواصل معك للتأكيد 🙏',
+      text: ok
+        ? 'تم استلام طلب الإلغاء وتحديث الطلب ❌'
+        : 'حصلت مشكلة أثناء إلغاء الطلب، فريقنا هيتواصل معك 🙏',
     });
     await insertLog({
       shopify_order_id: orderId,
@@ -1611,8 +1695,14 @@ async function processInboundWhatsAppMessage(msg) {
       recipient_phone: from,
       template_id: null,
       variables: { action: 'cancel', button: label },
-      success: true,
-      response: '[inbound] cancel acknowledged (no Shopify change)',
+      success: Boolean(ok),
+      response: `[inbound] cancel -> ${
+        ok
+          ? r.alreadyCancelled
+            ? 'already cancelled'
+            : 'tagged cancelled'
+          : (r && r.message) || 'failed'
+      }`,
     });
   }
 }

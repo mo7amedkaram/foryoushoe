@@ -674,11 +674,69 @@ export async function fetchOrderById(orderId) {
 }
 
 // ------------------------------------------------------------
-//  confirmShopifyOrder(orderId) — marks the order confirmed by
-//  adding a tag (and a note). Requires write_orders (granted).
+//  Order status lifecycle — three mutually-exclusive WhatsApp
+//  statuses tracked as Shopify order tags. An order ends up with
+//  at most ONE of these at a time (confirm/cancel are final;
+//  pending never overrides a final state).
 // ------------------------------------------------------------
 export const CONFIRM_TAG = 'WhatsApp Confirmed';
+export const PENDING_TAG = 'Pending Confirmation';
+export const CANCEL_TAG = 'WhatsApp Cancelled';
 
+// ------------------------------------------------------------
+//  setOrderStatusTags(orderId, { add=[], remove=[] })
+//
+//  Generic, idempotent tag mutator. Fetches the order, parses the
+//  comma-separated `tags`, removes everything in `remove[]`
+//  (case-insensitive) and adds everything in `add[]` that is not
+//  already present (case-insensitive). Exact casing on write.
+//  Never throws — returns { ok, tags } or { ok:false, error }.
+// ------------------------------------------------------------
+export async function setOrderStatusTags(orderId, { add = [], remove = [] } = {}) {
+  try {
+    const got = await fetchOrderById(orderId);
+    if (!got.ok) return { ok: false, error: got.error, message: got.message };
+    const o = got.order;
+
+    const removeLc = new Set(
+      (Array.isArray(remove) ? remove : [])
+        .map((t) => String(t || '').trim().toLowerCase())
+        .filter(Boolean)
+    );
+    const addList = (Array.isArray(add) ? add : [])
+      .map((t) => String(t || '').trim())
+      .filter(Boolean);
+
+    let tags = String(o.tags || '')
+      .split(',')
+      .map((t) => t.trim())
+      .filter(Boolean)
+      .filter((t) => !removeLc.has(t.toLowerCase()));
+
+    for (const t of addList) {
+      if (!tags.some((x) => x.toLowerCase() === t.toLowerCase())) {
+        tags.push(t);
+      }
+    }
+
+    const nextTags = tags.join(', ');
+    const res = await adminApiSend('PUT', `orders/${o.id}.json`, {
+      order: { id: o.id, tags: nextTags },
+    });
+    if (!res.ok) return { ok: false, error: res.error, message: res.message };
+    const saved = (res.data && res.data.order) || null;
+    return { ok: true, tags: saved ? saved.tags : nextTags, order: saved };
+  } catch (err) {
+    return { ok: false, error: 'EXCEPTION', message: err.message };
+  }
+}
+
+// ------------------------------------------------------------
+//  confirmShopifyOrder(orderId) — final state CONFIRMED.
+//  Adds CONFIRM_TAG and clears PENDING_TAG + CANCEL_TAG so a
+//  confirmation always wins over a prior pending/cancelled state.
+//  Keeps the existing return shape + `alreadyConfirmed` behavior.
+// ------------------------------------------------------------
 export async function confirmShopifyOrder(orderId) {
   const got = await fetchOrderById(orderId);
   if (!got.ok) return { ok: false, error: got.error, message: got.message };
@@ -690,12 +748,65 @@ export async function confirmShopifyOrder(orderId) {
   if (existing.some((t) => t.toLowerCase() === CONFIRM_TAG.toLowerCase())) {
     return { ok: true, alreadyConfirmed: true, order: o };
   }
-  existing.push(CONFIRM_TAG);
-  const res = await adminApiSend('PUT', `orders/${o.id}.json`, {
-    order: { id: o.id, tags: existing.join(', ') },
+  const res = await setOrderStatusTags(o.id, {
+    add: [CONFIRM_TAG],
+    remove: [PENDING_TAG, CANCEL_TAG],
   });
   if (!res.ok) return { ok: false, error: res.error, message: res.message };
-  return { ok: true, order: res.data && res.data.order };
+  return { ok: true, order: res.order };
+}
+
+// ------------------------------------------------------------
+//  cancelShopifyOrder(orderId) — final state CANCELLED.
+//  Adds CANCEL_TAG and clears PENDING_TAG + CONFIRM_TAG. Same
+//  shape as confirmShopifyOrder (+ `alreadyCancelled`).
+// ------------------------------------------------------------
+export async function cancelShopifyOrder(orderId) {
+  const got = await fetchOrderById(orderId);
+  if (!got.ok) return { ok: false, error: got.error, message: got.message };
+  const o = got.order;
+  const existing = String(o.tags || '')
+    .split(',')
+    .map((t) => t.trim())
+    .filter(Boolean);
+  if (existing.some((t) => t.toLowerCase() === CANCEL_TAG.toLowerCase())) {
+    return { ok: true, alreadyCancelled: true, order: o };
+  }
+  const res = await setOrderStatusTags(o.id, {
+    add: [CANCEL_TAG],
+    remove: [PENDING_TAG, CONFIRM_TAG],
+  });
+  if (!res.ok) return { ok: false, error: res.error, message: res.message };
+  return { ok: true, order: res.order };
+}
+
+// ------------------------------------------------------------
+//  markOrderPending(orderId) — soft state PENDING.
+//  Adds PENDING_TAG ONLY IF the order has NO final state
+//  (no CONFIRM_TAG and no CANCEL_TAG). Never overrides a final
+//  state; no-op otherwise. Returns quietly (best effort).
+// ------------------------------------------------------------
+export async function markOrderPending(orderId) {
+  try {
+    const got = await fetchOrderById(orderId);
+    if (!got.ok) return { ok: false, error: got.error, skipped: true };
+    const o = got.order;
+    const existing = String(o.tags || '')
+      .split(',')
+      .map((t) => t.trim().toLowerCase())
+      .filter(Boolean);
+    if (
+      existing.includes(CONFIRM_TAG.toLowerCase()) ||
+      existing.includes(CANCEL_TAG.toLowerCase()) ||
+      existing.includes(PENDING_TAG.toLowerCase())
+    ) {
+      // Already has a final state, or already pending — no-op.
+      return { ok: true, skipped: true };
+    }
+    return await setOrderStatusTags(o.id, { add: [PENDING_TAG] });
+  } catch (err) {
+    return { ok: false, error: 'EXCEPTION', message: err.message };
+  }
 }
 
 // ------------------------------------------------------------
@@ -768,10 +879,15 @@ export default {
   fetchLatestOrder,
   fetchOrderById,
   confirmShopifyOrder,
+  cancelShopifyOrder,
+  markOrderPending,
+  setOrderStatusTags,
   getOrderItemsDetailed,
   fetchProductImageUrl,
   enrichOrderFromShopify,
   CONFIRM_TAG,
+  PENDING_TAG,
+  CANCEL_TAG,
   OAUTH_SCOPES,
   ADMIN_API_VERSION,
 };
