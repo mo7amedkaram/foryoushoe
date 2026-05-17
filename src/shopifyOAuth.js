@@ -679,9 +679,36 @@ export async function fetchOrderById(orderId) {
 //  at most ONE of these at a time (confirm/cancel are final;
 //  pending never overrides a final state).
 // ------------------------------------------------------------
-export const CONFIRM_TAG = 'WhatsApp Confirmed';
-export const PENDING_TAG = 'Pending Confirmation';
-export const CANCEL_TAG = 'WhatsApp Cancelled';
+// Canonical status tags: English text + an emoji prefix so they're
+// visually distinguishable in the Shopify order list (Shopify can't
+// color tags, but an emoji inside the tag text shows up clearly).
+export const CONFIRM_TAG = '✅ WhatsApp Confirmed';
+export const PENDING_TAG = '⏳ Pending Confirmation';
+export const CANCEL_TAG = '❌ WhatsApp Cancelled';
+
+// Legacy (no-emoji) + canonical strings recognised for each status,
+// so the transition/backfill is seamless and any state change
+// normalises old plain tags to the new emoji ones automatically.
+const CONFIRM_ALIASES = [CONFIRM_TAG, 'WhatsApp Confirmed'];
+const PENDING_ALIASES = [PENDING_TAG, 'Pending Confirmation'];
+const CANCEL_ALIASES = [CANCEL_TAG, 'WhatsApp Cancelled'];
+export const ALL_STATUS_ALIASES = [
+  ...CONFIRM_ALIASES,
+  ...PENDING_ALIASES,
+  ...CANCEL_ALIASES,
+];
+
+// Pure tag → status. Precedence confirmed > cancelled > pending.
+export function statusFromTags(tags) {
+  const lc = (Array.isArray(tags) ? tags : String(tags || '').split(','))
+    .map((t) => String(t || '').trim().toLowerCase())
+    .filter(Boolean);
+  const any = (arr) => arr.some((a) => lc.includes(a.toLowerCase()));
+  if (any(CONFIRM_ALIASES)) return 'confirmed';
+  if (any(CANCEL_ALIASES)) return 'cancelled';
+  if (any(PENDING_ALIASES)) return 'pending';
+  return 'none';
+}
 
 // ------------------------------------------------------------
 //  setOrderStatusTags(orderId, { add=[], remove=[] })
@@ -748,9 +775,11 @@ export async function confirmShopifyOrder(orderId) {
   if (existing.some((t) => t.toLowerCase() === CONFIRM_TAG.toLowerCase())) {
     return { ok: true, alreadyConfirmed: true, order: o };
   }
+  // Remove every status alias (legacy + canonical) then add the
+  // canonical confirmed tag → normalises old plain tags too.
   const res = await setOrderStatusTags(o.id, {
     add: [CONFIRM_TAG],
-    remove: [PENDING_TAG, CANCEL_TAG],
+    remove: ALL_STATUS_ALIASES,
   });
   if (!res.ok) return { ok: false, error: res.error, message: res.message };
   return { ok: true, order: res.order };
@@ -774,7 +803,7 @@ export async function cancelShopifyOrder(orderId) {
   }
   const res = await setOrderStatusTags(o.id, {
     add: [CANCEL_TAG],
-    remove: [PENDING_TAG, CONFIRM_TAG],
+    remove: ALL_STATUS_ALIASES,
   });
   if (!res.ok) return { ok: false, error: res.error, message: res.message };
   return { ok: true, order: res.order };
@@ -791,16 +820,9 @@ export async function markOrderPending(orderId) {
     const got = await fetchOrderById(orderId);
     if (!got.ok) return { ok: false, error: got.error, skipped: true };
     const o = got.order;
-    const existing = String(o.tags || '')
-      .split(',')
-      .map((t) => t.trim().toLowerCase())
-      .filter(Boolean);
-    if (
-      existing.includes(CONFIRM_TAG.toLowerCase()) ||
-      existing.includes(CANCEL_TAG.toLowerCase()) ||
-      existing.includes(PENDING_TAG.toLowerCase())
-    ) {
-      // Already has a final state, or already pending — no-op.
+    // Any existing status (legacy or canonical) → no-op; never
+    // override a confirmed/cancelled/pending state.
+    if (statusFromTags(o.tags) !== 'none') {
       return { ok: true, skipped: true };
     }
     return await setOrderStatusTags(o.id, { add: [PENDING_TAG] });

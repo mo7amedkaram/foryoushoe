@@ -56,6 +56,7 @@ import {
   CONFIRM_TAG,
   PENDING_TAG,
   CANCEL_TAG,
+  statusFromTags,
   OAUTH_SCOPES,
 } from './src/shopifyOAuth.js';
 import { buildSampleOrder } from './src/sampleOrder.js';
@@ -774,15 +775,11 @@ const UNCONFIRMED_FIELDS =
 // more than one). A Shopify-cancelled order (cancelled_at) is
 // treated as 'cancelled' too.
 function deriveOrderStatus(order) {
-  const tags = String((order && order.tags) || '')
-    .split(',')
-    .map((t) => t.trim().toLowerCase())
-    .filter(Boolean);
-  if (tags.includes(CONFIRM_TAG.toLowerCase())) return 'confirmed';
-  if (tags.includes(CANCEL_TAG.toLowerCase()) || (order && order.cancelled_at)) {
-    return 'cancelled';
-  }
-  if (tags.includes(PENDING_TAG.toLowerCase())) return 'pending';
+  // Recognises both legacy plain tags and the new emoji tags.
+  const s = statusFromTags((order && order.tags) || '');
+  if (s === 'confirmed') return 'confirmed';
+  if (s === 'cancelled' || (order && order.cancelled_at)) return 'cancelled';
+  if (s === 'pending') return 'pending';
   return 'none';
 }
 
