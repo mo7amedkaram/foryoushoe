@@ -126,6 +126,25 @@ export function parseMetaTemplate(raw) {
     variables.push({ index: i, name });
   }
 
+  const buttonsComp =
+    components.find((c) => c && String(c.type).toUpperCase() === 'BUTTONS') ||
+    null;
+  const rawButtons =
+    buttonsComp && Array.isArray(buttonsComp.buttons) ? buttonsComp.buttons : [];
+  const urlButtons = rawButtons
+    .map((b, i) => ({
+      index: String(i),
+      text: b && b.text ? String(b.text) : '',
+      url: b && b.url ? String(b.url) : '',
+      hasVariable: /\{\{\s*\d+\s*\}\}/.test(String((b && b.url) || '')),
+      raw: b,
+    }))
+    .filter(
+      (b) =>
+        b.raw &&
+        String(b.raw.type || '').toUpperCase() === 'URL'
+    );
+
   return {
     name: raw.name,
     language: raw.language || 'en',
@@ -134,6 +153,7 @@ export function parseMetaTemplate(raw) {
     body: bodyText,
     variables,
     bodyParamCount: maxIndex,
+    urlButtons,
     raw,
   };
 }
@@ -241,6 +261,8 @@ export async function sendTemplateMessage({
   languageCode = 'en',
   orderedValues = [],
   headerImageUrl = '',
+  buttonUrlText = '',
+  buttonUrlIndex = '0',
 }) {
   if (!isMetaConfigured()) {
     return {
@@ -292,6 +314,14 @@ export async function sendTemplateMessage({
   }
   if (parameters.length) {
     components.push({ type: 'body', parameters });
+  }
+  if (buttonUrlText) {
+    components.push({
+      type: 'button',
+      sub_type: 'url',
+      index: String(buttonUrlIndex || '0'),
+      parameters: [{ type: 'text', text: sanitizeParam(buttonUrlText) }],
+    });
   }
 
   const payload = {

@@ -30,6 +30,7 @@ import {
   sendTextMessage as metaSendText,
   getPhoneNumbers as metaGetPhoneNumbers,
   listTemplatesMeta,
+  getTemplateMeta,
 } from './src/meta.js';
 import {
   verifyWebhookHmac,
@@ -38,6 +39,7 @@ import {
   resolveVariablesForOrder,
   pickRecipientPhone,
   normalizePhone,
+  extractTrackingDetails,
 } from './src/shopify.js';
 import {
   isValidShop,
@@ -74,6 +76,8 @@ app.disable('x-powered-by');
 //  and JSON/urlencoded parsers for everything else.
 // ------------------------------------------------------------
 app.use('/webhooks/shopify/orders-create', express.raw({ type: '*/*', limit: '2mb' }));
+app.use('/webhooks/shopify/orders-updated', express.raw({ type: '*/*', limit: '2mb' }));
+app.use('/webhooks/shopify/orders-fulfilled', express.raw({ type: '*/*', limit: '2mb' }));
 app.use(
   express.json({
     limit: '1mb',
@@ -274,6 +278,7 @@ const ADMIN_GUARDED = [
   ['POST', '/api/shopify/generate-token'],
   ['POST', '/api/shopify/test-last-order'],
   ['POST', '/api/orders/send-all'],
+  ['POST', '/api/order-updates/run'],
   // Per-order manual send: matched by prefix (the :id is dynamic) in
   // the guard below, so it is intentionally NOT a static entry here.
 ];
@@ -1149,6 +1154,45 @@ app.post(
 );
 
 // ------------------------------------------------------------
+//  POST /api/order-updates/run
+//  Manual/admin trigger for the same fulfilled-order job that runs
+//  on the Railway cron interval. Useful for smoke tests and for
+//  forcing a catch-up batch after deploy.
+// ------------------------------------------------------------
+app.post(
+  '/api/order-updates/run',
+  wrap(async (req, res) => {
+    const body = req.body || {};
+    const limit = Math.min(
+      Math.max(
+        parseInt(body.scan_limit ?? body.limit, 10) ||
+          config.orderUpdates.batchLimit,
+        1
+      ),
+      250
+    );
+    const sendLimit = Math.min(
+      Math.max(parseInt(body.send_limit, 10) || limit, 1),
+      limit
+    );
+    const result = await runOrderUpdateJob({
+      source: 'manual-order-update-run',
+      limit,
+      sendLimit,
+    });
+    const code =
+      result.ok || !result.error
+        ? 200
+        : result.error === 'NOT_CONNECTED'
+        ? 409
+        : result.status === 401 || result.status === 403
+        ? result.status
+        : 502;
+    res.status(code).json(result);
+  })
+);
+
+// ------------------------------------------------------------
 //  Shared pipeline: resolve + send + log for a given order.
 // ------------------------------------------------------------
 async function processOrder(
@@ -1322,6 +1366,327 @@ function isRealShopifyOrderId(id) {
   return /^\d+$/.test(String(id == null ? '' : id).trim());
 }
 
+// ============================================================
+//  FULFILLED ORDER UPDATES
+//  Sends the order_update Meta template when Shopify marks an
+//  order fulfilled and the fulfillment has tracking details.
+// ============================================================
+
+const ORDER_UPDATE_FIELDS =
+  'id,name,order_number,created_at,updated_at,currency,total_price,' +
+  'financial_status,fulfillment_status,customer,phone,shipping_address,' +
+  'billing_address,fulfillments';
+
+const ORDER_UPDATE_FALLBACK_BODY_VARS = [
+  'customerName',
+  'orderNumber',
+  'storeName',
+  'trackingNumber',
+  'trackingLink',
+];
+
+const ORDER_UPDATE_RESOLVER_ALIASES = {
+  trackingNo: 'trackingNumber',
+  trackingCode: 'trackingNumber',
+  trackingId: 'trackingNumber',
+  trackingURL: 'trackingLink',
+  trackingUrl: 'trackingLink',
+  trackingLink: 'trackingLink',
+  trackingCompanyName: 'trackingCompany',
+};
+
+function isFulfilledOrder(order) {
+  return String((order && order.fulfillment_status) || '').toLowerCase() === 'fulfilled';
+}
+
+function resolveOrderUpdateVar(order, settings, name) {
+  const clean = String(name || '').trim();
+  const resolverId = resolvers[clean]
+    ? clean
+    : ORDER_UPDATE_RESOLVER_ALIASES[clean] || '';
+  if (resolverId && resolvers[resolverId] && typeof resolvers[resolverId].fn === 'function') {
+    try {
+      const v = resolvers[resolverId].fn(order, settings);
+      return v == null ? '' : String(v);
+    } catch {
+      return '';
+    }
+  }
+  return '';
+}
+
+function pickDynamicUrlButton(templateMeta) {
+  const buttons = Array.isArray(templateMeta && templateMeta.urlButtons)
+    ? templateMeta.urlButtons
+    : [];
+  return buttons.find((b) => b.hasVariable) || null;
+}
+
+function buildButtonUrlParam(templateButton, trackingLink) {
+  const link = String(trackingLink || '').trim();
+  if (!link) return '';
+  const rawUrl = String((templateButton && templateButton.url) || '');
+  const prefix = rawUrl.replace(/\{\{\s*\d+\s*\}\}/g, '');
+  if (prefix && link.startsWith(prefix)) return link.slice(prefix.length);
+  return link;
+}
+
+function buildOrderUpdateButtonParam(templateButton, tracking) {
+  const link = String((tracking && tracking.trackingLink) || '').trim();
+  const number = String((tracking && tracking.trackingNumber) || '').trim();
+  const rawUrl = String((templateButton && templateButton.url) || '');
+  const prefix = rawUrl.replace(/\{\{\s*\d+\s*\}\}/g, '');
+  if (prefix && link.startsWith(prefix)) return link.slice(prefix.length);
+  if (prefix && number) return number;
+  return link || number;
+}
+
+function orderUpdateBodyVarNames(templateMeta) {
+  const vars =
+    templateMeta && Array.isArray(templateMeta.variables)
+      ? templateMeta.variables.map((v) => String(v.name || '').trim()).filter(Boolean)
+      : [];
+  if (!vars.length) return ORDER_UPDATE_FALLBACK_BODY_VARS;
+  return vars.map((name, i) => {
+    const known =
+      resolvers[name] ||
+      ORDER_UPDATE_RESOLVER_ALIASES[name] ||
+      /^var\d+$/i.test(name);
+    return known ? name : ORDER_UPDATE_FALLBACK_BODY_VARS[i] || name;
+  });
+}
+
+async function getOrderUpdateTemplateMeta() {
+  const templateName = config.meta.orderUpdateTemplateName;
+  if (!templateName) return null;
+  try {
+    const r = await getTemplateMeta(templateName);
+    return r && r.ok ? r.template : null;
+  } catch {
+    return null;
+  }
+}
+
+async function processOrderUpdate(
+  order,
+  {
+    source,
+    phoneOverride = '',
+    skipIdempotency = false,
+    logIneligible = true,
+    templateMeta = null,
+  } = {}
+) {
+  const templateName = config.meta.orderUpdateTemplateName;
+  const cfg = await getConfig();
+  const settings = cfg.settings || {};
+
+  const resolveRecipient = () => {
+    if (phoneOverride && String(phoneOverride).trim()) {
+      return normalizePhone(
+        phoneOverride,
+        (settings && settings.default_country_code) ||
+          config.defaults.defaultCountryCode
+      );
+    }
+    return pickRecipientPhone(order, settings);
+  };
+
+  const tracking = extractTrackingDetails(order);
+  const ineligible = !isFulfilledOrder(order)
+    ? 'Order is not fulfilled.'
+    : !tracking.trackingNumber
+    ? 'Fulfilled order has no tracking number yet.'
+    : !tracking.trackingLink
+    ? 'Fulfilled order has no tracking link yet.'
+    : '';
+
+  if (ineligible) {
+    const rec = {
+      shopify_order_id: order && order.id,
+      order_number: order && (order.name || order.order_number),
+      recipient_phone: resolveRecipient(),
+      template_id: templateName,
+      variables: { tracking },
+      success: false,
+      skipped: true,
+      response: ineligible,
+    };
+    if (logIneligible) await insertLog(rec);
+    return rec;
+  }
+
+  const already = skipIdempotency
+    ? false
+    : await hasSuccessfulLog(order.id, templateName);
+  if (already) {
+    return {
+      shopify_order_id: order.id,
+      order_number: order.name || order.order_number,
+      template_id: templateName,
+      success: true,
+      skipped: true,
+      response: 'Skipped: order_update already sent successfully for this order.',
+    };
+  }
+
+  const phoneNumber = resolveRecipient();
+  if (!phoneNumber) {
+    const rec = {
+      shopify_order_id: order.id,
+      order_number: order.name || order.order_number,
+      recipient_phone: '',
+      template_id: templateName,
+      variables: { tracking },
+      success: false,
+      response: 'No recipient phone number could be resolved from the order.',
+    };
+    if (logIneligible) await insertLog(rec);
+    return rec;
+  }
+
+  const liveTemplate = templateMeta || (await getOrderUpdateTemplateMeta());
+  const bodyVars = orderUpdateBodyVarNames(liveTemplate);
+
+  const values = {};
+  for (const name of bodyVars) {
+    values[name] = resolveOrderUpdateVar(order, settings, name);
+  }
+
+  const orderedValues = bodyVars.map((name) => values[name] || '');
+  const dynamicButton = pickDynamicUrlButton(liveTemplate);
+  const buttonUrlIndex =
+    (dynamicButton && dynamicButton.index) || config.meta.orderUpdateButtonIndex || '0';
+  const buttonUrlText = buildOrderUpdateButtonParam(dynamicButton, tracking);
+
+  let sendResult;
+  try {
+    const m = await metaSendTemplate({
+      to: phoneNumber,
+      templateName,
+      languageCode: config.meta.templateLang,
+      orderedValues,
+      buttonUrlText,
+      buttonUrlIndex,
+    });
+    sendResult = {
+      success: m.success,
+      httpStatus: m.httpStatus,
+      raw: m.messageId ? `msg ${m.messageId} :: ${m.raw}` : m.raw,
+    };
+  } catch (err) {
+    sendResult = { success: false, raw: `send error: ${err.message}`, httpStatus: 0 };
+  }
+
+  const rec = {
+    shopify_order_id: order.id,
+    order_number: order.name || order.order_number,
+    recipient_phone: phoneNumber,
+    template_id: templateName,
+    variables: {
+      ...values,
+      trackingNumber: tracking.trackingNumber,
+      trackingLink: tracking.trackingLink,
+      trackingCompany: tracking.trackingCompany,
+      __buttonUrlIndex: buttonUrlIndex,
+      __buttonUrlText: buttonUrlText,
+    },
+    success: sendResult.success,
+    response: `[${source || 'order-update'}] HTTP ${sendResult.httpStatus} :: ${sendResult.raw}`,
+  };
+  await insertLog(rec);
+  return rec;
+}
+
+async function fetchFulfilledOrdersForUpdate(limit = config.orderUpdates.batchLimit) {
+  const n = Math.min(Math.max(parseInt(limit, 10) || config.orderUpdates.batchLimit, 1), 250);
+  const result = await adminApiGet(
+    'orders.json?status=any&limit=' +
+      encodeURIComponent(String(n)) +
+      '&order=updated_at+desc&fields=' +
+      ORDER_UPDATE_FIELDS
+  );
+  if (!result.ok) {
+    return {
+      ok: false,
+      error: result.error || 'FETCH_FAILED',
+      message: result.message || 'Could not fetch fulfilled Shopify orders.',
+      status: result.status,
+      orders: [],
+    };
+  }
+  const orders = Array.isArray(result.data && result.data.orders)
+    ? result.data.orders.filter(isFulfilledOrder)
+    : [];
+  return { ok: true, orders };
+}
+
+async function runOrderUpdateJob({
+  source = 'order-update-cron',
+  limit = config.orderUpdates.batchLimit,
+  sendLimit = config.orderUpdates.batchLimit,
+} = {}) {
+  const fetched = await fetchFulfilledOrdersForUpdate(limit);
+  if (!fetched.ok) return { ok: false, ...fetched, attempted: 0, sent: 0, failed: 0, skipped: 0 };
+
+  const templateMeta = await getOrderUpdateTemplateMeta();
+  const maxSends = Math.min(
+    Math.max(parseInt(sendLimit, 10) || config.orderUpdates.batchLimit, 1),
+    250
+  );
+  let attempted = 0;
+  let sent = 0;
+  let failed = 0;
+  let skipped = 0;
+  const results = [];
+
+  for (let i = 0; i < fetched.orders.length; i++) {
+    const order = fetched.orders[i];
+    try {
+      const out = await processOrderUpdate(order, {
+        source,
+        logIneligible: false,
+        templateMeta,
+      });
+      if (out && out.skipped) {
+        skipped += 1;
+      } else {
+        attempted += 1;
+        if (out && out.success) sent += 1;
+        else failed += 1;
+      }
+      results.push({
+        order_number: (out && out.order_number) || order.order_number,
+        success: Boolean(out && out.success),
+        skipped: Boolean(out && out.skipped),
+        response: (out && out.response) || '',
+      });
+    } catch (err) {
+      attempted += 1;
+      failed += 1;
+      results.push({
+        order_number: order && (order.name || order.order_number),
+        success: false,
+        skipped: false,
+        response: `error: ${err.message}`,
+      });
+    }
+    if (attempted >= maxSends) break;
+    if (i < fetched.orders.length - 1) await sleep(SEND_ALL_DELAY_MS);
+  }
+
+  return {
+    ok: true,
+    scanned: fetched.orders.length,
+    attempted,
+    sent,
+    failed,
+    skipped,
+    template: config.meta.orderUpdateTemplateName,
+    results,
+  };
+}
+
 // ------------------------------------------------------------
 //  POST /api/test-send
 //  body: { phone_number, template_id?, phone_number_id? }
@@ -1423,6 +1788,64 @@ app.post(
       return res.status(200).json({ ok: true, note: 'error logged' });
     }
   })
+);
+
+async function handleShopifyOrderUpdateWebhook(req, res, source) {
+  const rawBody = req.body;
+  const hmacHeader = req.get('X-Shopify-Hmac-Sha256');
+
+  const valid = verifyWebhookHmac(rawBody, hmacHeader, config.shopify.apiSecret);
+  if (!valid) {
+    console.warn(`[${source}] HMAC verification FAILED.`);
+    return res.status(401).json({ ok: false, error: 'HMAC verification failed' });
+  }
+
+  let order;
+  try {
+    order = JSON.parse(
+      Buffer.isBuffer(rawBody) ? rawBody.toString('utf8') : String(rawBody || '{}')
+    );
+  } catch {
+    console.warn(`[${source}] received invalid JSON body.`);
+    return res.status(200).json({ ok: true, note: 'invalid json acknowledged' });
+  }
+
+  try {
+    const result = await processOrderUpdate(order, {
+      source,
+      logIneligible: false,
+    });
+    return res.status(200).json({ ok: true, result });
+  } catch (err) {
+    console.error(`[${source}] order_update pipeline error:`, err.message);
+    await insertLog({
+      shopify_order_id: order && order.id,
+      order_number: order && (order.name || order.order_number),
+      recipient_phone: null,
+      template_id: config.meta.orderUpdateTemplateName,
+      variables: {},
+      success: false,
+      response: `order_update pipeline error: ${err.message}`,
+    });
+    return res.status(200).json({ ok: true, note: 'error logged' });
+  }
+}
+
+// Optional near-real-time hooks. The Railway interval job remains the
+// fallback/catch-up path, but these make fulfilled-order updates send
+// immediately when Shopify posts the status change.
+app.post(
+  '/webhooks/shopify/orders-updated',
+  wrap(async (req, res) =>
+    handleShopifyOrderUpdateWebhook(req, res, 'shopify-orders-updated')
+  )
+);
+
+app.post(
+  '/webhooks/shopify/orders-fulfilled',
+  wrap(async (req, res) =>
+    handleShopifyOrderUpdateWebhook(req, res, 'shopify-orders-fulfilled')
+  )
 );
 
 // ------------------------------------------------------------
@@ -1723,5 +2146,41 @@ const server = app.listen(config.port, () => {
   console.log(`  Supabase: ${isSupabaseEnabled() ? 'connected' : 'DEGRADED (in-memory)'}`);
   console.log(`  Webhook:  POST /webhooks/shopify/orders-create\n`);
 });
+
+let orderUpdateJobRunning = false;
+async function runScheduledOrderUpdateJob() {
+  if (orderUpdateJobRunning) return;
+  orderUpdateJobRunning = true;
+  try {
+    const r = await runOrderUpdateJob({ source: 'order-update-cron' });
+    if (!r.ok) {
+      console.warn(
+        `[order-update-cron] skipped: ${r.error || 'FETCH_FAILED'} ` +
+          `${r.message || ''}`.trim()
+      );
+    } else if (r.attempted || config.debug) {
+      console.log(
+        `[order-update-cron] scanned=${r.scanned} attempted=${r.attempted} ` +
+          `sent=${r.sent} failed=${r.failed} skipped=${r.skipped}`
+      );
+    }
+  } catch (err) {
+    console.error('[order-update-cron] error:', err.message);
+  } finally {
+    orderUpdateJobRunning = false;
+  }
+}
+
+if (config.orderUpdates.cronEnabled) {
+  const interval = config.orderUpdates.cronIntervalMs;
+  console.log(
+    `  Order update cron: enabled every ${Math.round(interval / 1000)}s ` +
+      `(template=${config.meta.orderUpdateTemplateName})`
+  );
+  setTimeout(runScheduledOrderUpdateJob, Math.min(interval, 15000));
+  setInterval(runScheduledOrderUpdateJob, interval);
+} else {
+  console.log('  Order update cron: disabled');
+}
 
 export default server;

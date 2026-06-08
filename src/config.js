@@ -59,8 +59,25 @@ export const config = {
     // Active template sent to customers. order_confirm_iamge has an
     // IMAGE header (product photo) + 11 body params.
     templateName: process.env.META_TEMPLATE_NAME || 'order_confirm_iamge',
+    // Fulfilled-order tracking update template. This template is sent
+    // separately from the order confirmation template.
+    orderUpdateTemplateName:
+      process.env.META_ORDER_UPDATE_TEMPLATE_NAME || 'order_update',
+    orderUpdateButtonIndex: process.env.META_ORDER_UPDATE_BUTTON_INDEX || '0',
     // Optional fallback header image if a product has none.
     fallbackImage: process.env.META_FALLBACK_IMAGE || '',
+  },
+
+  orderUpdates: {
+    cronEnabled: process.env.ORDER_UPDATE_CRON_ENABLED !== 'false',
+    cronIntervalMs: Math.max(
+      parseInt(process.env.ORDER_UPDATE_CRON_INTERVAL_MS || '60000', 10),
+      15000
+    ),
+    batchLimit: Math.min(
+      Math.max(parseInt(process.env.ORDER_UPDATE_CRON_BATCH_LIMIT || '50', 10), 1),
+      250
+    ),
   },
 
   // Which provider sends the WhatsApp message: 'meta' (direct) | 'joud'.

@@ -329,6 +329,10 @@ HTTP `401` and nothing is sent. (See `src/shopify.js`.)
 | `customerCity`     | shipping (fallback billing) `city` |
 | `customerGovernorate` | shipping (fallback billing) `province` |
 | `productImage`     | first line item image URL if present (often empty on webhooks → map to Static text with a URL) |
+| `trackingNumber`   | tracking number(s) from `order.fulfillments[]` |
+| `trackingLink`     | first tracking URL from `order.fulfillments[]` |
+| `trackingUrl`      | alias for `trackingLink` |
+| `trackingCompany`  | tracking carrier/company from `order.fulfillments[]` |
 
 Each template variable is mapped (in the UI) to one of these resolvers
 **or** to a static constant string. Mapping is stored in
@@ -367,12 +371,49 @@ code in *Settings* or via `DEFAULT_COUNTRY_CODE` in `.env`.
 | GET  | `/api/shopify/status` | `{ connected, shop, scope, obtained_at }` |
 | GET  | `/api/shopify/last-order` | latest real order + 12-variable preview + suggestedMapping |
 | POST | `/webhooks/shopify/orders-create` | Shopify webhook (HMAC verified) |
+| POST | `/api/order-updates/run` | admin/manual trigger for fulfilled-order `order_update` sends |
+| POST | `/webhooks/shopify/orders-updated` | optional near-real-time fulfilled-order update hook |
+| POST | `/webhooks/shopify/orders-fulfilled` | optional near-real-time fulfilled-order update hook |
 
 The webhook always returns `200` quickly (Shopify requirement); the
 real outcome — success or the joud.chat error — is recorded in the
 message log. External joud.chat calls are capped at ~10s. Idempotency
 is best-effort: a successful send for the same `order id + template`
 is skipped.
+
+### Fulfilled-order tracking updates
+
+The app also polls Shopify for recently updated orders whose
+`fulfillment_status` is `fulfilled`. When a fulfilled order has both a
+tracking number and a tracking URL in its `fulfillments[]`, it sends
+the Meta template named by `META_ORDER_UPDATE_TEMPLATE_NAME`
+(default: `order_update`). The tracking URL is sent as a dynamic URL
+button parameter, and `message_log` idempotency prevents duplicate
+`order_update` sends for the same Shopify order.
+
+Manual test body:
+
+```json
+{ "scan_limit": 25, "send_limit": 1 }
+```
+
+Railway runs this in the normal web process:
+
+```env
+META_ORDER_UPDATE_TEMPLATE_NAME=order_update
+META_ORDER_UPDATE_BUTTON_INDEX=0
+ORDER_UPDATE_CRON_ENABLED=true
+ORDER_UPDATE_CRON_INTERVAL_MS=60000
+ORDER_UPDATE_CRON_BATCH_LIMIT=50
+```
+
+For faster delivery than the polling interval, register Shopify
+webhooks for order update / fulfillment events pointing at:
+
+```text
+https://YOUR-PUBLIC-URL/webhooks/shopify/orders-updated
+https://YOUR-PUBLIC-URL/webhooks/shopify/orders-fulfilled
+```
 
 ---
 

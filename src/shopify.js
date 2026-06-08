@@ -64,6 +64,66 @@ function fullName(obj) {
   return `${fn} ${ln}`.trim();
 }
 
+function asArray(v) {
+  if (Array.isArray(v)) return v;
+  if (v == null || v === '') return [];
+  return [v];
+}
+
+function uniqueStrings(values) {
+  const seen = new Set();
+  const out = [];
+  for (const v of values) {
+    const s = String(v == null ? '' : v).trim();
+    if (!s || seen.has(s)) continue;
+    seen.add(s);
+    out.push(s);
+  }
+  return out;
+}
+
+// Pull tracking data from Shopify order fulfillments. Shopify can
+// expose both singular and plural tracking fields; prefer the newest
+// fulfillment with a URL/number, but retain all unique values for
+// body text when there are multiple shipments.
+export function extractTrackingDetails(order) {
+  const fulfillments = Array.isArray(order && order.fulfillments)
+    ? order.fulfillments.slice()
+    : [];
+
+  fulfillments.sort((a, b) => {
+    const ta =
+      Date.parse((a && (a.updated_at || a.created_at)) || '') || 0;
+    const tb =
+      Date.parse((b && (b.updated_at || b.created_at)) || '') || 0;
+    return tb - ta;
+  });
+
+  const numbers = [];
+  const urls = [];
+  const companies = [];
+  for (const f of fulfillments) {
+    if (!f || typeof f !== 'object') continue;
+    numbers.push(...asArray(f.tracking_numbers), f.tracking_number);
+    urls.push(...asArray(f.tracking_urls), f.tracking_url);
+    companies.push(f.tracking_company);
+  }
+
+  const trackingNumbers = uniqueStrings(numbers);
+  const trackingUrls = uniqueStrings(urls).filter((u) => /^https?:\/\//i.test(u));
+  const trackingCompanies = uniqueStrings(companies);
+
+  return {
+    trackingNumber: trackingNumbers[0] || '',
+    trackingNumbers,
+    trackingLink: trackingUrls[0] || '',
+    trackingUrl: trackingUrls[0] || '',
+    trackingUrls,
+    trackingCompany: trackingCompanies[0] || '',
+    trackingCompanies,
+  };
+}
+
 // ------------------------------------------------------------
 //  Phone normalization
 //
@@ -234,6 +294,27 @@ export const resolvers = {
       ).trim();
     },
   },
+  trackingNumber: {
+    label: 'Tracking number',
+    fn: (order) => {
+      const t = extractTrackingDetails(order);
+      return t.trackingNumbers.length
+        ? t.trackingNumbers.join(', ')
+        : t.trackingNumber;
+    },
+  },
+  trackingLink: {
+    label: 'Tracking link',
+    fn: (order) => extractTrackingDetails(order).trackingLink,
+  },
+  trackingUrl: {
+    label: 'Tracking URL',
+    fn: (order) => extractTrackingDetails(order).trackingUrl,
+  },
+  trackingCompany: {
+    label: 'Tracking company',
+    fn: (order) => extractTrackingDetails(order).trackingCompany,
+  },
 };
 
 // List of resolver options for the UI.
@@ -317,6 +398,7 @@ export function resolveVariablesForOrder(order, mapping = {}, settings = {}) {
 export default {
   verifyWebhookHmac,
   normalizePhone,
+  extractTrackingDetails,
   resolvers,
   resolverOptions,
   pickRecipientPhone,
