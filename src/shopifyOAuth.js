@@ -480,6 +480,40 @@ export async function fetchLatestOrder() {
 //  variant's own image, then the product's featured image, then
 //  the first product image. Never throws — returns '' on any miss.
 // ------------------------------------------------------------
+async function fetchPublicCatalogProduct(productId) {
+  const shop = config.shopify.shopDomain;
+  if (!isValidShop(shop)) return null;
+
+  try {
+    const response = await fetchWithTimeout(
+      `https://${shop}/products.json?limit=250`
+    );
+    if (!response.ok) return null;
+    const catalog = safeJsonParse(await response.text(), null);
+    const products = Array.isArray(catalog && catalog.products)
+      ? catalog.products
+      : [];
+    return (
+      products.find((product) => String(product.id) === String(productId)) || null
+    );
+  } catch (error) {
+    if (error instanceof TypeError || error.name === 'AbortError') return null;
+    throw error;
+  }
+}
+
+async function fetchProductById(productId) {
+  const response = await adminApiGet(
+    `products/${productId}.json?fields=id,image,images,options,variants`
+  );
+  if (response.ok && response.data && response.data.product) {
+    return response.data.product;
+  }
+
+  // Some Shopify app installations grant order access without product access.
+  return fetchPublicCatalogProduct(productId);
+}
+
 export async function fetchProductImageUrl(order) {
   try {
     const items = Array.isArray(order && order.line_items)
@@ -491,11 +525,8 @@ export async function fetchProductImageUrl(order) {
     const productId = String(li.product_id);
     const variantId = li.variant_id ? String(li.variant_id) : '';
 
-    const res = await adminApiGet(
-      `products/${productId}.json?fields=id,image,images,variants`
-    );
-    if (!res.ok || !res.data || !res.data.product) return '';
-    const p = res.data.product;
+    const p = await fetchProductById(productId);
+    if (!p) return '';
     const images = Array.isArray(p.images) ? p.images : [];
 
     // 1. The exact variant's image, if the variant has one.
@@ -540,10 +571,7 @@ export async function enrichOrderFromShopify(order) {
     const getProduct = async (pid) => {
       if (!pid) return null;
       if (cache.has(pid)) return cache.get(pid);
-      const res = await adminApiGet(
-        `products/${pid}.json?fields=id,image,images,options,variants`
-      );
-      const p = res && res.ok && res.data ? res.data.product : null;
+      const p = await fetchProductById(pid);
       cache.set(pid, p || null);
       return p;
     };

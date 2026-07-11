@@ -1,11 +1,11 @@
-# Shopify → joud.chat WhatsApp Bridge
+# Shopify → WhatsApp Order Confirmation Bridge
 
 A single-page Node.js (Express) + Supabase app that receives Shopify
-`orders/create` webhooks, resolves the order fields into a joud.chat
-WhatsApp template's variables, and sends the WhatsApp message to the
-customer. Configuration, the variable mapping, and a send log are
-stored in Supabase (with an in-memory fallback if Supabase is not
-configured).
+`orders/create` webhooks, resolves order fields into WhatsApp template
+parameters, and sends confirmation messages through Meta's WhatsApp
+Cloud API. Configuration, variable mappings, and send logs are stored
+in Supabase, with an in-memory fallback when Supabase is not configured.
+joud.chat remains available for legacy template discovery.
 
 > ملاحظات بالعربية مختصرة موجودة بعد كل قسم.
 
@@ -63,17 +63,20 @@ Supabase (اختياري). البرنامج يعمل حتى بدونها لكن 
 npm start
 ```
 
-Open <http://localhost:3000>. Then:
+Open <http://localhost:3000>. The dashboard is organized by task:
 
-1. **Settings** – set `phone_number_id`, store name, default country
-   code (e.g. `20` for Egypt), recipient phone source → Save.
-2. **Templates** – click *Load templates* (fetched live from
-   joud.chat), pick a template. Its body and detected variables show.
-3. **Mapping** – for each template variable, choose a Shopify field
-   resolver or "Static text" → Save.
-4. **Test send** – enter your WhatsApp number → *Send test*. A sample
-   order runs through the exact same pipeline as a real webhook.
-5. **Logs** – recent sends with status and the raw joud.chat response.
+1. **نظرة عامة / Overview** – check Supabase and WhatsApp health, then
+   load the latest real order and review its resolved message values.
+2. **الطلبات / Orders** – list orders by WhatsApp status, send one
+   confirmation, or send a capped batch of unsent confirmations.
+3. **سجل الإرسال / Activity** – review recent provider responses and
+   filter the log to failures only.
+4. **الإعدادات / Settings** – manage Shopify credentials, store and
+   phone settings, template mappings, and sample-order test sends.
+
+Mutating and sending actions request `ADMIN_UI_TOKEN` when admin
+protection is enabled. The token is retained in that browser's local
+storage and sent in the `x-admin-token` header.
 
 **عربي:** شغّل `npm start`، افتح الصفحة، احفظ الإعدادات، حمّل القوالب،
 اربط المتغيرات، ثم جرّب الإرسال وراقب السجل.
@@ -250,8 +253,9 @@ Partner-created apps, so the app must obtain a token through the
 1. Make sure `.env` has `SHOP_DOMAIN`, `SHOPIFY_API_KEY`,
    `SHOPIFY_API_SECRET`, and the Supabase keys, then run the server
    (`npm start`) and the tunnel.
-2. In a **browser**, open `https://<PUBLIC_TUNNEL>/auth`
-   (or click **ربط المتجر بشوبيفاي** in the UI — it navigates there).
+2. In a **browser**, open `https://<PUBLIC_TUNNEL>/auth`. The dashboard's
+   **Settings → Shopify connection** section uses the separate headless
+   client-credentials flow instead.
 3. You are sent to Shopify's authorize screen. Approve the app.
 4. Shopify redirects back to `https://<PUBLIC_TUNNEL>/auth/callback`.
    The app verifies the `shop` regex, the `state` nonce (httpOnly
@@ -261,13 +265,12 @@ Partner-created apps, so the app must obtain a token through the
    **offline access token** and stores it in Supabase
    (`public.shopify_auth`, single row `id=1`). **The offline token
    does not expire.**
-5. You return to the app with `?connected=1`; the *Connect Shopify*
-   card now shows **Connected ✓** with the shop, scope and timestamp.
+5. You return to the app with `?connected=1`; **Settings → Shopify
+   connection** shows the connected shop, scope, and token expiry.
 
 ### 7.3 Build / verify the mapping on a real order
 
-1. In the UI, *Connect Shopify* card → **تحميل آخر أوردر**
-   (*Load last order*). The app calls
+1. In **نظرة عامة / Overview**, click **تحميل أحدث طلب**. The app calls
    `GET /api/shopify/last-order`, fetches the **most recent real
    order** (Admin REST `2025-01`, `orders.json?status=any&limit=1`
    newest-first), and shows each of the 12 template variables with its
@@ -328,7 +331,7 @@ HTTP `401` and nothing is sent. (See `src/shopify.js`.)
 | `otherAddress`     | billing address (same format) |
 | `customerCity`     | shipping (fallback billing) `city` |
 | `customerGovernorate` | shipping (fallback billing) `province` |
-| `productImage`     | first line item image URL if present (often empty on webhooks → map to Static text with a URL) |
+| `productImage`     | first product image; Admin API first, then the store's public product catalog, then `META_FALLBACK_IMAGE` |
 | `trackingNumber`   | tracking number(s) from `order.fulfillments[]` |
 | `trackingLink`     | first tracking URL from `order.fulfillments[]` |
 | `trackingUrl`      | alias for `trackingLink` |

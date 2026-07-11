@@ -11,6 +11,22 @@
   let TEMPLATES = [];
   let CURRENT_TEMPLATE = null;
 
+  function showView(viewName) {
+    document.querySelectorAll('[data-view-panel]').forEach((panel) => {
+      panel.hidden = panel.dataset.viewPanel !== viewName;
+    });
+    document.querySelectorAll('.view-tab').forEach((tab) => {
+      const active = tab.dataset.viewTarget === viewName;
+      tab.classList.toggle('active', active);
+      tab.setAttribute('aria-selected', String(active));
+    });
+    window.scrollTo({ top: 0, behavior: 'auto' });
+  }
+
+  document.querySelectorAll('[data-view-target]').forEach((trigger) => {
+    trigger.addEventListener('click', () => showView(trigger.dataset.viewTarget));
+  });
+
   // ---- toast ----
   let toastTimer = null;
   function toast(msg, kind = '') {
@@ -121,7 +137,7 @@
     try {
       const h = await api('/api/health');
       $('healthDot').className = 'dot ok';
-      $('healthText').textContent = 'متصل';
+      $('healthText').textContent = 'النظام يعمل';
       $('supabaseBadge').textContent = h.supabase ? 'Supabase: متصل' : 'Supabase: وضع مؤقت (ذاكرة)';
       $('supabaseBadge').className = 'badge ' + (h.supabase ? 'ok' : 'warn');
     } catch {
@@ -752,7 +768,7 @@
       toast('فشل توليد الرمز: ' + e.message, 'bad');
     } finally {
       btn.disabled = false;
-      btn.textContent = '🔑 توليد رمز الوصول / Generate Access Token';
+      btn.textContent = 'تجديد رمز الوصول';
     }
   });
 

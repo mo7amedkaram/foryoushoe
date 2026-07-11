@@ -1,0 +1,123 @@
+{
+  "schemaVersion": 2,
+  "generatedAt": "2026-07-11T07:45:00Z",
+  "title": "Design System: For You Shoe Operations",
+  "extensions": {
+    "colorMeta": {
+      "primary": {
+        "role": "primary",
+        "displayName": "Ledger Green",
+        "canonical": "oklch(48% 0.105 153)",
+        "tonalRamp": ["oklch(18% 0.04 153)", "oklch(28% 0.065 153)", "oklch(38% 0.09 153)", "oklch(48% 0.105 153)", "oklch(60% 0.09 153)", "oklch(72% 0.065 153)", "oklch(84% 0.04 153)", "oklch(94% 0.02 153)"]
+      },
+      "canvas": {
+        "role": "neutral",
+        "displayName": "Daylight Canvas",
+        "canonical": "oklch(97% 0.009 145)",
+        "tonalRamp": ["oklch(18% 0.009 145)", "oklch(30% 0.009 145)", "oklch(42% 0.009 145)", "oklch(54% 0.009 145)", "oklch(66% 0.009 145)", "oklch(78% 0.009 145)", "oklch(89% 0.009 145)", "oklch(97% 0.009 145)"]
+      },
+      "danger": {
+        "role": "tertiary",
+        "displayName": "Exception Red",
+        "canonical": "oklch(50% 0.13 20)",
+        "tonalRamp": ["oklch(18% 0.05 20)", "oklch(28% 0.08 20)", "oklch(39% 0.11 20)", "oklch(50% 0.13 20)", "oklch(61% 0.11 20)", "oklch(73% 0.08 20)", "oklch(85% 0.05 20)", "oklch(95% 0.025 20)"]
+      }
+    },
+    "typographyMeta": {
+      "headline": { "displayName": "Page Headline", "purpose": "Names the current operational view." },
+      "body": { "displayName": "Interface Body", "purpose": "Arabic-first instructions and order context." },
+      "label": { "displayName": "Operational Label", "purpose": "Forms, statuses, metadata, and table headings." }
+    },
+    "shadows": [
+      { "name": "desk-lift", "value": "0 1px 2px color-mix(in oklch, var(--text) 8%, transparent)", "purpose": "Primary working panels only." },
+      { "name": "toast-float", "value": "0 18px 44px color-mix(in oklch, var(--text) 12%, transparent)", "purpose": "Transient feedback only." }
+    ],
+    "motion": [
+      { "name": "ease-out", "value": "cubic-bezier(0.16, 1, 0.3, 1)", "purpose": "Short state and view transitions." }
+    ],
+    "breakpoints": [
+      { "name": "compact", "value": "640px" },
+      { "name": "stacked", "value": "900px" }
+    ]
+  },
+  "components": [
+    {
+      "name": "Primary Button",
+      "kind": "button",
+      "refersTo": "button-primary",
+      "description": "The single highest-priority action in a view.",
+      "html": "<button class=\"ds-btn-primary\">تحميل أحدث طلب</button>",
+      "css": ".ds-btn-primary { min-height:42px; padding:9px 16px; border:1px solid var(--primary); border-radius:6px; background:var(--primary); color:var(--surface); font:700 15px/1.4 system-ui; transition:background 160ms cubic-bezier(.16,1,.3,1); } .ds-btn-primary:hover { background:var(--primary-hover); } .ds-btn-primary:focus-visible { outline:3px solid color-mix(in oklch,var(--primary) 38%,transparent); outline-offset:2px; }"
+    },
+    {
+      "name": "Secondary Button",
+      "kind": "button",
+      "refersTo": "button-secondary",
+      "description": "A bordered supporting action.",
+      "html": "<button class=\"ds-btn-secondary\">تحديث الطلبات</button>",
+      "css": ".ds-btn-secondary { min-height:42px; padding:9px 16px; border:1px solid var(--border-strong); border-radius:6px; background:var(--surface); color:var(--text); font:700 15px/1.4 system-ui; } .ds-btn-secondary:hover { background:var(--surface-muted); } .ds-btn-secondary:focus-visible { outline:3px solid color-mix(in oklch,var(--primary) 38%,transparent); outline-offset:2px; }"
+    },
+    {
+      "name": "Text Field",
+      "kind": "input",
+      "refersTo": "input",
+      "description": "A compact field for operational settings and phone numbers.",
+      "html": "<input class=\"ds-input\" dir=\"ltr\" value=\"201000000000\" />",
+      "css": ".ds-input { width:260px; min-height:42px; padding:8px 11px; border:1px solid var(--border-strong); border-radius:6px; background:var(--surface); color:var(--text); font:400 15px/1.4 system-ui; } .ds-input:hover { border-color:var(--text-muted); } .ds-input:focus-visible { border-color:var(--primary); outline:3px solid color-mix(in oklch,var(--primary) 38%,transparent); outline-offset:2px; }"
+    },
+    {
+      "name": "View Navigation",
+      "kind": "nav",
+      "description": "Familiar top tabs divide routine work from settings.",
+      "html": "<nav class=\"ds-nav\"><button class=\"ds-tab ds-active\">الطلبات</button><button class=\"ds-tab\">سجل الإرسال</button></nav>",
+      "css": ".ds-nav { display:flex; gap:22px; border-bottom:1px solid var(--border); direction:rtl; } .ds-tab { min-height:44px; padding:8px 2px 12px; border:0; border-bottom:2px solid transparent; background:transparent; color:var(--text-muted); font:400 15px/1.4 system-ui; } .ds-tab:hover { color:var(--text); } .ds-tab.ds-active { border-bottom-color:var(--primary); color:var(--primary-hover); font-weight:700; } .ds-tab:focus-visible { outline:3px solid color-mix(in oklch,var(--primary) 38%,transparent); outline-offset:2px; }"
+    },
+    {
+      "name": "Pending Status",
+      "kind": "chip",
+      "description": "Text and color communicate an order awaiting customer confirmation.",
+      "html": "<span class=\"ds-status\"><span aria-hidden=\"true\">◷</span> بانتظار التأكيد</span>",
+      "css": ".ds-status { display:inline-flex; align-items:center; gap:6px; padding:3px 9px; border:1px solid color-mix(in oklch,var(--warning) 28%,var(--border)); border-radius:999px; background:var(--warning-soft); color:var(--warning); font:700 12px/1.4 system-ui; }"
+    },
+    {
+      "name": "Working Panel",
+      "kind": "card",
+      "refersTo": "panel",
+      "description": "A single primary work surface, never nested inside another panel.",
+      "html": "<section class=\"ds-panel\"><strong>أحدث طلب</strong><p>مراجعة بيانات رسالة التأكيد</p></section>",
+      "css": ".ds-panel { width:320px; padding:24px; border:1px solid var(--border); border-radius:14px; background:var(--surface); color:var(--text); box-shadow:0 1px 2px color-mix(in oklch,var(--text) 8%,transparent); font:400 15px/1.6 system-ui; direction:rtl; } .ds-panel strong { display:block; font-size:20px; } .ds-panel p { margin:6px 0 0; color:var(--text-muted); }"
+    }
+  ],
+  "narrative": {
+    "northStar": "The Clear Order Desk",
+    "overview": "This interface feels like a well-organized work surface at the center of a busy store: bright enough for daytime use, quiet enough for concentration, and structured around the next operational decision. Familiar product patterns make the system disappear into the order-confirmation task. The system is calm, trustworthy, and efficient.",
+    "keyCharacteristics": [
+      "Arabic-first hierarchy with correct LTR treatment for identifiers.",
+      "Operational views for overview, orders, activity, and settings.",
+      "Restrained green accent reserved for actions and healthy status.",
+      "Progressive disclosure for configuration and response detail.",
+      "Responsive structure with reduced-motion support."
+    ],
+    "rules": [
+      { "name": "The Ten Percent Rule", "body": "Ledger Green occupies no more than ten percent of a routine screen and appears only for action, selection, or state.", "section": "colors" },
+      { "name": "The Status Has Words Rule", "body": "Success, pending, and failure always include a readable label or symbol; color never carries meaning alone.", "section": "colors" },
+      { "name": "The One Family Rule", "body": "UI labels, buttons, data, and headings use one sans-serif family; display type is prohibited.", "section": "typography" },
+      { "name": "The Flat Desk Rule", "body": "Surfaces at the same hierarchy never cast shadows on each other.", "section": "elevation" }
+    ],
+    "dos": [
+      "Do lead every view with its operational purpose and one primary action.",
+      "Do keep routine order work separate from infrequent integration settings.",
+      "Do use progressive disclosure for mappings, tokens, and raw provider responses.",
+      "Do preserve RTL reading while rendering phone numbers, IDs, and API data LTR.",
+      "Do maintain 42px controls, visible keyboard focus, and reduced-motion behavior."
+    ],
+    "donts": [
+      "Don't use a card-heavy setup wizard.",
+      "Don't use arbitrary numbering or decorative dashboard clutter.",
+      "Don't expose excessive technical copy before an operator asks for detail.",
+      "Don't return to dark styling that makes routine daytime work feel like an incident console.",
+      "Don't use colored side-stripe borders, gradient text, glassmorphism, or nested cards.",
+      "Don't rely on color alone to communicate status."
+    ]
+  }
+}

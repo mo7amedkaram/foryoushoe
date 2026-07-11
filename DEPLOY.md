@@ -103,8 +103,10 @@ Railway gives a public HTTPS domain, e.g. `https://foryoushoe.up.railway.app`.
    `https://<domain>/webhooks/shopify/orders-create` (HMAC-verified with
    `SHOPIFY_API_SECRET`).
 
-4. Open `https://<domain>/` → it will prompt once for `ADMIN_UI_TOKEN`
-   (stored in your browser), then Load last order / Save mapping / Test send.
+4. Open `https://<domain>/`. Use **Overview** to load the latest order,
+   **Orders** to send confirmations, **Activity** to inspect failures, and
+   **Settings** for Shopify credentials, mappings, and test sends. Protected
+   actions prompt for `ADMIN_UI_TOKEN`, which is stored in that browser.
 
 ## Verify the full flow
 - Place (or use the latest) Shopify order → confirmation template arrives

@@ -3,309 +3,334 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>جسر شوبيفاي ↔ واتساب (joud.chat)</title>
+  <meta name="theme-color" content="#f5f7f4" />
+  <title>For You Shoe | تأكيد الطلبات</title>
   <link rel="stylesheet" href="/style.css" />
 </head>
 <body>
-  <div class="app">
-    <header class="topbar">
-      <div class="brand">
-        <span class="logo">WA</span>
-        <div>
-          <h1>جسر شوبيفاي ↔ واتساب</h1>
-          <p class="sub" dir="ltr">Shopify orders → joud.chat WhatsApp templates</p>
+  <div class="app-shell">
+    <header class="app-header">
+      <div class="header-row">
+        <div class="brand">
+          <span class="logo" aria-hidden="true">FY</span>
+          <div>
+            <h1>For You Shoe</h1>
+            <p class="sub">تأكيد طلبات شوبيفاي عبر واتساب</p>
+          </div>
+        </div>
+        <div class="status" id="statusBox" role="status" aria-live="polite">
+          <span class="dot" id="healthDot"></span>
+          <span id="healthText">جارٍ فحص النظام…</span>
         </div>
       </div>
-      <div class="status" id="statusBox">
-        <span class="dot" id="healthDot"></span>
-        <span id="healthText">جارٍ الفحص…</span>
-      </div>
+
+      <nav class="view-nav" aria-label="أقسام لوحة التحكم">
+        <button class="view-tab active" type="button" data-view-target="overview" aria-selected="true">
+          نظرة عامة
+        </button>
+        <button class="view-tab" type="button" data-view-target="orders" aria-selected="false">
+          الطلبات
+        </button>
+        <button class="view-tab" type="button" data-view-target="activity" aria-selected="false">
+          سجل الإرسال
+        </button>
+        <button class="view-tab" type="button" data-view-target="settings" aria-selected="false">
+          الإعدادات
+        </button>
+      </nav>
     </header>
 
-    <main>
-      <!-- 1. GENERATE ACCESS TOKEN (Shopify client-credentials) -->
-      <section class="card">
-        <h2><span class="num">1</span> ربط شوبيفاي — توليد رمز الوصول</h2>
-        <p class="hint">
-          بدون فتح شوبيفاي ولا متصفح: أدخل الدومين الفرعي للمتجر ومفاتيح
-          التطبيق (Client ID / Secret) ليتم توليد <b>Admin Access Token</b>
-          تلقائيًا (صلاحية 24 ساعة، يتجدّد ذاتيًا). ثم حمّل آخر أوردر حقيقي
-          لمراجعة ربط متغيرات القالب على بيانات فعلية.
-        </p>
-
-        <div class="shopify-status-bar">
-          <span class="dot" id="shopifyDot"></span>
-          <span id="shopifyStatusText">جارٍ فحص الاتصال…</span>
-          <span class="muted ltr" id="shopifyStatusMeta"></span>
-        </div>
-
-        <div class="grid" style="margin-top:14px">
-          <label>
-            الدومين الفرعي للمتجر (Store Sub-Domain)
-            <input id="shopSubDomain" type="text" dir="ltr"
-                   placeholder="for-you-shoe-6129" />
-          </label>
-          <label>
-            Client ID
-            <input id="shopClientId" type="text" dir="ltr"
-                   placeholder="اتركه فارغًا لاستخدام إعدادات .env" />
-          </label>
-          <label>
-            Client Secret
-            <input id="shopClientSecret" type="password" dir="ltr"
-                   placeholder="اتركه فارغًا لاستخدام إعدادات .env" />
-          </label>
-        </div>
-
-        <div class="row" style="margin-top:12px">
-          <button class="btn primary" id="generateToken">
-            🔑 توليد رمز الوصول / Generate Access Token
-          </button>
-          <button class="btn" id="loadLastOrder">تحميل آخر أوردر</button>
-        </div>
-
-        <div id="tokenResultBox" class="preview hidden">
-          <h3>تم توليد رمز الوصول بنجاح ✓</h3>
-          <div class="kv">
-            <b>ACCESS TOKEN</b>
-            <span class="ltr token-val">
-              <code id="genToken"></code>
-              <button class="btn ghost sm" id="copyToken">نسخ</button>
-            </span>
+    <main class="workspace">
+      <section class="workspace-view" data-view-panel="overview" aria-labelledby="overviewTitle">
+        <div class="page-heading">
+          <div>
+            <p class="eyebrow">حالة التشغيل</p>
+            <h2 id="overviewTitle">الطلبات والرسائل في مكان واحد</h2>
+            <p>راجع الاتصال، حمّل أحدث طلب، وتأكد من جاهزية الإرسال.</p>
           </div>
-          <div class="kv"><b>SCOPE</b><span class="ltr" id="genScope"></span></div>
-          <div class="kv"><b>EXPIRES IN</b><span class="ltr" id="genExpires"></span></div>
-          <p class="hint">
-            الرمز محفوظ في Supabase ويُستخدم تلقائيًا. الويب هوك يستقبل
-            الأوردرات ويرسل القالب دون أي خطوة يدوية إضافية.
-          </p>
+          <div class="page-actions">
+            <button class="btn primary" id="loadLastOrder" type="button">تحميل أحدث طلب</button>
+            <button class="btn" type="button" data-view-target="orders">عرض الطلبات</button>
+          </div>
+        </div>
+
+        <div class="system-strip" aria-label="حالة التكاملات">
+          <span id="supabaseBadge" class="badge">Supabase: جارٍ الفحص</span>
+          <span id="metaBadge" class="badge">WhatsApp: جارٍ الفحص</span>
+          <span class="badge neutral" dir="ltr" id="shopBadge"></span>
         </div>
 
         <div id="lastOrderError" class="callout bad hidden" dir="auto"></div>
 
-        <div id="lastOrderBox" class="preview hidden">
+        <section id="lastOrderBox" class="panel hidden" aria-labelledby="latestOrderTitle">
+          <div class="panel-heading">
+            <div>
+              <p class="eyebrow">أحدث طلب</p>
+              <h3 id="latestOrderTitle">مراجعة بيانات رسالة التأكيد</h3>
+            </div>
+          </div>
+
           <div class="order-summary" id="orderSummary" dir="auto"></div>
 
-          <h3>معاينة متغيرات القالب على الأوردر الحقيقي</h3>
-          <p class="hint" id="mappingSourceHint" dir="auto"></p>
-          <div class="table-wrap">
-            <table id="previewTable">
-              <thead>
-                <tr>
-                  <th>#</th>
-                  <th>متغير القالب</th>
-                  <th>الربط (Mapping)</th>
-                  <th>القيمة من الأوردر</th>
-                </tr>
-              </thead>
-              <tbody id="previewBody"></tbody>
-            </table>
-          </div>
-          <button class="btn primary" id="saveRealMapping" style="margin-top:14px">
-            حفظ الربط / Save mapping
-          </button>
+          <details class="disclosure">
+            <summary>مراجعة ربط متغيرات القالب</summary>
+            <p class="hint" id="mappingSourceHint" dir="auto"></p>
+            <div class="table-wrap">
+              <table id="previewTable">
+                <thead>
+                  <tr>
+                    <th>#</th>
+                    <th>متغير القالب</th>
+                    <th>الربط</th>
+                    <th>القيمة من الطلب</th>
+                  </tr>
+                </thead>
+                <tbody id="previewBody"></tbody>
+              </table>
+            </div>
+            <button class="btn primary" id="saveRealMapping" type="button">حفظ الربط</button>
+          </details>
 
-          <div class="test-last-order">
-            <h3>إرسال تجريبي ببيانات آخر أوردر</h3>
-            <p class="hint">
-              يرسل بيانات آخر أوردر حقيقي عبر القالب المحفوظ، لكن إلى الرقم
-              الذي تكتبه (بدلًا من رقم العميل) للتأكد من وصول الرسالة.
-            </p>
+          <div class="inline-tool">
+            <div>
+              <h4>اختبار ببيانات أحدث طلب</h4>
+              <p>أرسل نفس البيانات إلى رقم تختاره دون استخدام رقم العميل.</p>
+            </div>
             <div class="row">
-              <input id="testLastOrderPhone" type="text" dir="ltr"
-                     class="grow" placeholder="201029941259" />
-              <button class="btn primary" id="sendTestLastOrder">
-                إرسال إلى هذا الرقم
-              </button>
+              <input id="testLastOrderPhone" type="tel" inputmode="numeric" dir="ltr"
+                     class="grow" aria-label="رقم واتساب للاختبار" placeholder="201000000000" />
+              <button class="btn" id="sendTestLastOrder" type="button">إرسال اختبار</button>
             </div>
             <pre id="testLastOrderResult" class="result hidden" dir="ltr"></pre>
           </div>
-        </div>
+        </section>
+
+        <section class="empty-guidance" aria-labelledby="workflowTitle">
+          <div>
+            <p class="eyebrow">مسار العمل</p>
+            <h3 id="workflowTitle">ما يحتاج انتباهك يظهر أولًا</h3>
+          </div>
+          <ol class="workflow-list">
+            <li><span>1</span><p><strong>راجع الطلبات</strong> وتأكد من وجود رقم واتساب صالح.</p></li>
+            <li><span>2</span><p><strong>أرسل التأكيد</strong> لطلب واحد أو للطلبات الجديدة.</p></li>
+            <li><span>3</span><p><strong>تابع النتيجة</strong> من سجل الإرسال وحالة العميل.</p></li>
+          </ol>
+        </section>
       </section>
 
-      <!-- 2. SETTINGS -->
-      <section class="card">
-        <h2><span class="num">2</span> الإعدادات</h2>
-        <p class="hint">إعدادات عامة للجسر. الحقول التقنية تظهر من اليسار لليمين.</p>
-        <div class="grid">
-          <label>
-            phone_number_id
-            <input id="phoneNumberId" type="text" dir="ltr" placeholder="1115965254927153" />
-          </label>
-          <label>
-            اسم المتجر (storeName)
-            <input id="storeName" type="text" placeholder="for-you-shoe" />
-          </label>
-          <label>
-            كود الدولة الافتراضي
-            <input id="countryCode" type="text" dir="ltr" placeholder="20" />
-          </label>
-          <label>
-            مصدر رقم هاتف العميل
-            <select id="phoneSource">
-              <option value="shipping">هاتف عنوان الشحن (الأفضل لهذا المتجر)</option>
-              <option value="customer">هاتف العميل</option>
-              <option value="billing">هاتف عنوان الفاتورة</option>
-              <option value="auto">تلقائي</option>
-            </select>
-          </label>
+      <section class="workspace-view" data-view-panel="orders" aria-labelledby="ordersTitle" hidden>
+        <div class="page-heading compact">
+          <div>
+            <p class="eyebrow">الطلبات</p>
+            <h2 id="ordersTitle">متابعة تأكيدات واتساب</h2>
+            <p>اعرض حالة كل طلب وأرسل الرسالة عند الحاجة.</p>
+          </div>
+          <button class="btn" id="loadUnconfirmed" type="button">تحديث الطلبات</button>
         </div>
-        <button class="btn primary" id="saveSettings">حفظ الإعدادات</button>
+
+        <section class="panel table-panel">
+          <div class="toolbar">
+            <div class="status-filter" id="ucStatusFilter" aria-label="تصفية حالة الطلب">
+              <button class="sf-btn active" type="button" data-status="">غير المؤكدة</button>
+              <button class="sf-btn" type="button" data-status="pending">بانتظار التأكيد</button>
+              <button class="sf-btn" type="button" data-status="cancelled">ملغاة</button>
+              <button class="sf-btn" type="button" data-status="confirmed">مؤكدة</button>
+            </div>
+            <div class="row">
+              <span class="muted" id="unconfirmedMeta"></span>
+              <button class="btn primary" id="sendAllUnconfirmed" type="button">إرسال للجدد</button>
+              <button class="btn hidden" id="sendNextBatch" type="button">الدفعة التالية</button>
+            </div>
+          </div>
+
+          <div id="unconfirmedError" class="callout bad hidden" dir="auto"></div>
+          <div class="table-wrap">
+            <table id="unconfirmedTable">
+              <thead>
+                <tr>
+                  <th>رقم الطلب</th>
+                  <th>العميل</th>
+                  <th>الهاتف</th>
+                  <th>الإجمالي</th>
+                  <th>التاريخ</th>
+                  <th>حالة الطلب</th>
+                  <th>حالة الإرسال</th>
+                  <th>إجراء</th>
+                </tr>
+              </thead>
+              <tbody id="unconfirmedBody">
+                <tr><td colspan="8" class="empty-cell">اضغط «تحديث الطلبات» للعرض.</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <div class="pager" id="unconfirmedPager">
+            <button class="btn ghost sm" id="ucPrev" type="button" disabled>السابق</button>
+            <span class="muted" id="ucPageInfo">—</span>
+            <button class="btn ghost sm" id="ucNext" type="button" disabled>التالي</button>
+          </div>
+        </section>
       </section>
 
-      <!-- 2. TEMPLATES -->
-      <section class="card">
-        <h2><span class="num">3</span> القوالب</h2>
-        <p class="hint">حمّل قوالب الرسائل من joud.chat واختر القالب المطلوب.</p>
-        <div class="row">
-          <button class="btn" id="loadTemplates">تحميل القوالب</button>
-          <select id="templateSelect" class="grow" dir="ltr">
-            <option value="">— لم يتم التحميل —</option>
-          </select>
+      <section class="workspace-view" data-view-panel="activity" aria-labelledby="activityTitle" hidden>
+        <div class="page-heading compact">
+          <div>
+            <p class="eyebrow">المراقبة</p>
+            <h2 id="activityTitle">سجل الإرسال</h2>
+            <p>راجع نتيجة الرسائل والأخطاء المسجلة دون إظهار التفاصيل إلا عند الحاجة.</p>
+          </div>
+          <button class="btn" id="refreshLogs" type="button">تحديث السجل</button>
         </div>
-        <div id="templatePreview" class="preview hidden">
-          <h3>نص القالب</h3>
-          <pre id="templateBody" dir="auto"></pre>
-          <h3>المتغيرات المكتشفة</h3>
-          <div id="templateVars" class="chips"></div>
-        </div>
+
+        <section class="panel table-panel">
+          <div class="toolbar">
+            <label class="inline-check">
+              <input type="checkbox" id="logsOnlyFailed" />
+              عرض الأخطاء فقط
+            </label>
+          </div>
+          <div class="table-wrap">
+            <table id="logsTable">
+              <thead>
+                <tr>
+                  <th>الوقت</th>
+                  <th>الطلب</th>
+                  <th>الهاتف</th>
+                  <th>القالب</th>
+                  <th>حالة الطلب</th>
+                  <th>الحالة</th>
+                  <th>الرد</th>
+                </tr>
+              </thead>
+              <tbody id="logsBody">
+                <tr><td colspan="7" class="empty-cell">لا توجد سجلات بعد.</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <div class="pager" id="logsPager">
+            <button class="btn ghost sm" id="logsPrev" type="button" disabled>السابق</button>
+            <span class="muted" id="logsPageInfo">—</span>
+            <button class="btn ghost sm" id="logsNext" type="button" disabled>التالي</button>
+          </div>
+        </section>
       </section>
 
-      <!-- 3. MAPPING -->
-      <section class="card">
-        <h2><span class="num">4</span> ربط المتغيرات</h2>
-        <p class="hint">اربط كل متغير في القالب بحقل من طلب شوبيفاي، أو نص ثابت.</p>
-        <div id="mappingArea" class="mapping-area">
-          <p class="muted">اختر قالبًا أولًا لعرض متغيراته.</p>
-        </div>
-        <button class="btn primary" id="saveMapping" disabled>حفظ الربط</button>
-      </section>
-
-      <!-- 4. TEST SEND -->
-      <section class="card">
-        <h2><span class="num">5</span> إرسال تجريبي</h2>
-        <p class="hint">يرسل طلبًا تجريبيًا عبر نفس مسار الإرسال الحقيقي.</p>
-        <div class="row">
-          <input id="testPhone" type="text" dir="ltr" placeholder="رقم الهاتف بصيغة دولية، مثال 201001234567" class="grow" />
-          <button class="btn primary" id="sendTest">إرسال تجريبي</button>
-        </div>
-        <pre id="testResult" class="result hidden" dir="ltr"></pre>
-      </section>
-
-      <!-- 6. UNCONFIRMED ORDERS -->
-      <section class="card">
-        <div class="card-head">
-          <h2><span class="num">6</span> 📋 الطلبات غير المؤكدة</h2>
-          <button class="btn ghost" id="loadUnconfirmed">
-            تحميل الطلبات غير المؤكدة
-          </button>
-        </div>
-        <p class="hint">
-          الطلبات التي لم تُوسَم بعد بـ «WhatsApp Confirmed» (وغير الملغاة).
-          يمكنك إرسال رسالة التأكيد لطلب واحد، أو دفعة كاملة. الإرسال للكل
-          يتخطّى الطلبات التي سبق إرسالها بنجاح، ويُرسل بحدّ أقصى 50 طلبًا
-          في كل مرة بتباعد بسيط بين الرسائل.
-        </p>
-
-        <div class="row" style="margin-bottom:12px">
-          <button class="btn primary" id="sendAllUnconfirmed">
-            إرسال للكل (غير المؤكدة)
-          </button>
-          <button class="btn hidden" id="sendNextBatch">
-            إرسال الدفعة التالية
-          </button>
-          <span class="muted" id="unconfirmedMeta"></span>
+      <section class="workspace-view" data-view-panel="settings" aria-labelledby="settingsTitle" hidden>
+        <div class="page-heading compact">
+          <div>
+            <p class="eyebrow">إعدادات النظام</p>
+            <h2 id="settingsTitle">التكامل والرسائل</h2>
+            <p>هذه الإعدادات لا تحتاج تغييرًا أثناء العمل اليومي.</p>
+          </div>
         </div>
 
-        <div class="status-filter" id="ucStatusFilter">
-          <span class="sf-label">تصفية حسب الحالة:</span>
-          <button class="sf-btn active" data-status="">الكل (غير المؤكدة)</button>
-          <button class="sf-btn" data-status="pending">⏳ بانتظار التأكيد</button>
-          <button class="sf-btn" data-status="cancelled">✗ ملغي</button>
-          <button class="sf-btn" data-status="confirmed">✓ مؤكد</button>
-        </div>
+        <section class="settings-section" aria-labelledby="shopifyTitle">
+          <div class="section-copy">
+            <h3 id="shopifyTitle">اتصال شوبيفاي</h3>
+            <p>تحقق من حالة الرمز أو أنشئ رمزًا جديدًا عند تغيير بيانات التطبيق.</p>
+          </div>
+          <div class="settings-content">
+            <div class="shopify-status-bar">
+              <span class="dot" id="shopifyDot"></span>
+              <span id="shopifyStatusText">جارٍ فحص الاتصال…</span>
+              <span class="muted ltr" id="shopifyStatusMeta"></span>
+            </div>
+            <div class="form-grid three">
+              <label>
+                دومين المتجر
+                <input id="shopSubDomain" type="text" dir="ltr" placeholder="for-you-shoe-6129" />
+              </label>
+              <label>
+                Client ID
+                <input id="shopClientId" type="text" dir="ltr" autocomplete="off"
+                       placeholder="استخدم قيمة البيئة عند تركه فارغًا" />
+              </label>
+              <label>
+                Client Secret
+                <input id="shopClientSecret" type="password" dir="ltr" autocomplete="off"
+                       placeholder="استخدم قيمة البيئة عند تركه فارغًا" />
+              </label>
+            </div>
+            <button class="btn" id="generateToken" type="button">تجديد رمز الوصول</button>
+            <div id="tokenResultBox" class="token-result hidden">
+              <div class="kv"><b>ACCESS TOKEN</b><span class="ltr token-val"><code id="genToken"></code><button class="btn ghost sm" id="copyToken" type="button">نسخ</button></span></div>
+              <div class="kv"><b>SCOPE</b><span class="ltr" id="genScope"></span></div>
+              <div class="kv"><b>EXPIRES IN</b><span class="ltr" id="genExpires"></span></div>
+            </div>
+          </div>
+        </section>
 
-        <div id="unconfirmedError" class="callout bad hidden" dir="auto"></div>
+        <section class="settings-section" aria-labelledby="generalSettingsTitle">
+          <div class="section-copy">
+            <h3 id="generalSettingsTitle">الإعدادات العامة</h3>
+            <p>اسم المتجر وطريقة قراءة رقم العميل في الرسالة.</p>
+          </div>
+          <div class="settings-content">
+            <div class="form-grid">
+              <label>
+                Phone number ID
+                <input id="phoneNumberId" type="text" dir="ltr" placeholder="1115965254927153" />
+              </label>
+              <label>
+                اسم المتجر
+                <input id="storeName" type="text" placeholder="For You Shoe" />
+              </label>
+              <label>
+                كود الدولة
+                <input id="countryCode" type="text" inputmode="numeric" dir="ltr" placeholder="20" />
+              </label>
+              <label>
+                مصدر رقم العميل
+                <select id="phoneSource">
+                  <option value="shipping">عنوان الشحن</option>
+                  <option value="customer">بيانات العميل</option>
+                  <option value="billing">عنوان الفاتورة</option>
+                  <option value="auto">تلقائي</option>
+                </select>
+              </label>
+            </div>
+            <button class="btn primary" id="saveSettings" type="button">حفظ الإعدادات</button>
+          </div>
+        </section>
 
-        <div class="table-wrap">
-          <table id="unconfirmedTable">
-            <thead>
-              <tr>
-                <th>رقم الأوردر</th>
-                <th>العميل</th>
-                <th>الهاتف</th>
-                <th>الإجمالي</th>
-                <th>التاريخ</th>
-                <th>حالة الطلب</th>
-                <th>حالة الإرسال</th>
-                <th>إجراء</th>
-              </tr>
-            </thead>
-            <tbody id="unconfirmedBody">
-              <tr><td colspan="8" class="muted">
-                اضغط «تحميل الطلبات غير المؤكدة» للعرض.
-              </td></tr>
-            </tbody>
-          </table>
-        </div>
+        <details class="settings-disclosure">
+          <summary>القالب وربط المتغيرات</summary>
+          <div class="settings-disclosure-body">
+            <div class="row">
+              <button class="btn" id="loadTemplates" type="button">تحميل القوالب</button>
+              <select id="templateSelect" class="grow" dir="ltr" aria-label="قالب الرسالة">
+                <option value="">— لم يتم التحميل —</option>
+              </select>
+            </div>
+            <div id="templatePreview" class="preview hidden">
+              <h4>نص القالب</h4>
+              <pre id="templateBody" dir="auto"></pre>
+              <h4>المتغيرات</h4>
+              <div id="templateVars" class="chips"></div>
+            </div>
+            <div id="mappingArea" class="mapping-area">
+              <p class="muted">اختر قالبًا لعرض متغيراته.</p>
+            </div>
+            <button class="btn primary" id="saveMapping" type="button" disabled>حفظ الربط</button>
+          </div>
+        </details>
 
-        <div class="pager" id="unconfirmedPager">
-          <button class="btn ghost sm" id="ucPrev" disabled>‹ السابق</button>
-          <span class="muted" id="ucPageInfo">—</span>
-          <button class="btn ghost sm" id="ucNext" disabled>التالي ›</button>
-        </div>
-      </section>
-
-      <!-- 7. LOGS / MONITORING -->
-      <section class="card">
-        <div class="card-head">
-          <h2><span class="num">7</span> سجل الإرسال / المراقبة</h2>
-          <button class="btn ghost" id="refreshLogs">تحديث</button>
-        </div>
-        <p class="hint">
-          كل عمليات الإرسال والردود الواردة. فعّل «أخطاء فقط» لمراقبة
-          الرسائل الفاشلة فقط مع نص الخطأ الكامل.
-        </p>
-        <div class="row" style="margin-bottom:10px">
-          <label class="inline-check">
-            <input type="checkbox" id="logsOnlyFailed" />
-            أخطاء فقط
-          </label>
-        </div>
-        <div class="table-wrap">
-          <table id="logsTable">
-            <thead>
-              <tr>
-                <th>الوقت</th>
-                <th>الطلب</th>
-                <th>الهاتف</th>
-                <th>القالب</th>
-                <th>حالة الطلب</th>
-                <th>الحالة</th>
-                <th>الرد</th>
-              </tr>
-            </thead>
-            <tbody id="logsBody">
-              <tr><td colspan="7" class="muted">لا توجد سجلات بعد.</td></tr>
-            </tbody>
-          </table>
-        </div>
-        <div class="pager" id="logsPager">
-          <button class="btn ghost sm" id="logsPrev" disabled>‹ السابق</button>
-          <span class="muted" id="logsPageInfo">—</span>
-          <button class="btn ghost sm" id="logsNext" disabled>التالي ›</button>
-        </div>
+        <details class="settings-disclosure">
+          <summary>إرسال رسالة اختبارية</summary>
+          <div class="settings-disclosure-body">
+            <p class="hint">استخدم رقمًا دوليًا لاختبار مسار الإرسال دون طلب حقيقي.</p>
+            <div class="row">
+              <input id="testPhone" type="tel" inputmode="numeric" dir="ltr"
+                     placeholder="201000000000" class="grow" aria-label="رقم واتساب للاختبار" />
+              <button class="btn primary" id="sendTest" type="button">إرسال اختبار</button>
+            </div>
+            <pre id="testResult" class="result hidden" dir="ltr"></pre>
+          </div>
+        </details>
       </section>
     </main>
-
-    <footer class="foot">
-      <span id="supabaseBadge" class="badge">…</span>
-      <span id="metaBadge" class="badge">…</span>
-      <span class="muted" dir="ltr" id="shopBadge"></span>
-    </footer>
   </div>
 
-  <div id="toast" class="toast"></div>
+  <div id="toast" class="toast" role="status" aria-live="polite"></div>
   <script src="/app.js"></script>
 </body>
 </html>
