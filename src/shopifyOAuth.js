@@ -846,27 +846,85 @@ export const CONFIRM_TAG = '✅ WhatsApp Confirmed';
 export const PENDING_TAG = '⏳ Pending Confirmation';
 export const CANCEL_TAG = '❌ WhatsApp Cancelled';
 
-// Legacy (no-emoji) + canonical strings recognised for each status,
-// so the transition/backfill is seamless and any state change
-// normalises old plain tags to the new emoji ones automatically.
-const CONFIRM_ALIASES = [CONFIRM_TAG, 'WhatsApp Confirmed'];
+// Call-desk tags (set by operators in Shopify) — must drive the same
+// lifecycle status as the WhatsApp tags. Exact strings + flexible
+// regex matching so emoji variants still resolve.
+const CONFIRM_ALIASES = [
+  CONFIRM_TAG,
+  'WhatsApp Confirmed',
+  '✅ Call Confirmed',
+  'Call Confirmed',
+];
 const PENDING_ALIASES = [PENDING_TAG, 'Pending Confirmation'];
-const CANCEL_ALIASES = [CANCEL_TAG, 'WhatsApp Cancelled'];
+const CANCEL_ALIASES = [
+  CANCEL_TAG,
+  'WhatsApp Cancelled',
+  '❌ Call Cancelled',
+  'Call Cancelled',
+];
 export const ALL_STATUS_ALIASES = [
   ...CONFIRM_ALIASES,
   ...PENDING_ALIASES,
   ...CANCEL_ALIASES,
 ];
 
+// Strip emoji / variation selectors so "✅ Call Confirmed" and
+// "Call Confirmed" match the same pattern.
+function normalizeStatusTag(tag) {
+  return String(tag || '')
+    .toLowerCase()
+    .replace(/[\u{1F300}-\u{1FAFF}\u{2600}-\u{27BF}\u{FE00}-\u{FE0F}\u{200D}]/gu, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function tagsMatchAny(tagList, aliases, patterns) {
+  const lcExact = new Set(
+    tagList.map((t) => String(t || '').trim().toLowerCase()).filter(Boolean)
+  );
+  const norms = tagList.map(normalizeStatusTag).filter(Boolean);
+  for (const a of aliases) {
+    if (lcExact.has(String(a).toLowerCase())) return true;
+    const na = normalizeStatusTag(a);
+    if (na && norms.includes(na)) return true;
+  }
+  for (const n of norms) {
+    for (const re of patterns) {
+      if (re.test(n)) return true;
+    }
+  }
+  return false;
+}
+
 // Pure tag → status. Precedence confirmed > cancelled > pending.
+// Recognises WhatsApp lifecycle tags AND operator Call Confirmed /
+// Call Cancelled tags (e.g. order #5595FY, #5585FY).
 export function statusFromTags(tags) {
-  const lc = (Array.isArray(tags) ? tags : String(tags || '').split(','))
-    .map((t) => String(t || '').trim().toLowerCase())
+  const list = (Array.isArray(tags) ? tags : String(tags || '').split(','))
+    .map((t) => String(t || '').trim())
     .filter(Boolean);
-  const any = (arr) => arr.some((a) => lc.includes(a.toLowerCase()));
-  if (any(CONFIRM_ALIASES)) return 'confirmed';
-  if (any(CANCEL_ALIASES)) return 'cancelled';
-  if (any(PENDING_ALIASES)) return 'pending';
+
+  if (
+    tagsMatchAny(list, CONFIRM_ALIASES, [
+      /\bwhatsapp\s*confirmed\b/,
+      /\bcall\s*confirmed\b/,
+    ])
+  ) {
+    return 'confirmed';
+  }
+  if (
+    tagsMatchAny(list, CANCEL_ALIASES, [
+      /\bwhatsapp\s*cancelled\b/,
+      /\bcall\s*cancelled\b/,
+    ])
+  ) {
+    return 'cancelled';
+  }
+  if (
+    tagsMatchAny(list, PENDING_ALIASES, [/\bpending\s*confirmation\b/])
+  ) {
+    return 'pending';
+  }
   return 'none';
 }
 

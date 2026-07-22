@@ -186,6 +186,33 @@ export function normalizeImageUrl(input) {
   return s;
 }
 
+// WhatsApp template IMAGE headers are most reliable with JPEG/PNG.
+// Many product assets are stored as .webp on Shopify CDN; Meta has
+// returned 132012 ("expected IMAGE, received UNKNOWN") for some of
+// those. Force Shopify's image service to emit JPEG when possible.
+export function toMetaSafeImageUrl(input) {
+  let s = normalizeImageUrl(input);
+  if (!s) return '';
+  const isShopifyCdn =
+    /cdn\.shopify\.com\//i.test(s) ||
+    /\/cdn\/shop\//i.test(s) ||
+    /\.myshopify\.com\//i.test(s);
+  const looksWebp = /\.webp(\?|#|$)/i.test(s) || /format=webp/i.test(s);
+  if (isShopifyCdn && looksWebp) {
+    try {
+      const u = new URL(s);
+      u.searchParams.delete('format');
+      u.searchParams.set('format', 'jpg');
+      // Prefer a moderate size so Meta can fetch quickly.
+      if (!u.searchParams.has('width')) u.searchParams.set('width', '1200');
+      s = u.toString();
+    } catch {
+      s = s.includes('?') ? `${s}&format=jpg` : `${s}?format=jpg`;
+    }
+  }
+  return s;
+}
+
 function isImageHeaderError(rawOrError) {
   const s = String(rawOrError || '');
   return (
@@ -305,7 +332,7 @@ function buildTemplatePayload({
 }) {
   const parameters = texts.map((t) => ({ type: 'text', text: t }));
   const components = [];
-  const imageLink = normalizeImageUrl(headerImageUrl);
+  const imageLink = toMetaSafeImageUrl(headerImageUrl);
 
   // Templates with an IMAGE header (order_confirm_iamge) MUST receive
   // a header component of type image. Omitting it produces Meta
@@ -471,8 +498,8 @@ export async function sendTemplateMessage({
     /* best effort — send unfitted if the template fetch fails */
   }
 
-  const primary = normalizeImageUrl(headerImageUrl);
-  const fallback = normalizeImageUrl(
+  const primary = toMetaSafeImageUrl(headerImageUrl);
+  const fallback = toMetaSafeImageUrl(
     fallbackImageUrl || config.meta.fallbackImage || ''
   );
   // Prefer product image; fall back to META_FALLBACK_IMAGE so IMAGE
@@ -614,5 +641,6 @@ export default {
   getTemplateMeta,
   parseMetaTemplate,
   normalizeImageUrl,
+  toMetaSafeImageUrl,
   sendTemplateMessage,
 };

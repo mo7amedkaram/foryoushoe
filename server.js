@@ -32,6 +32,7 @@ import {
   listTemplatesMeta,
   getTemplateMeta,
   normalizeImageUrl,
+  toMetaSafeImageUrl,
 } from './src/meta.js';
 import {
   verifyWebhookHmac,
@@ -876,18 +877,29 @@ async function computeUnconfirmedOrders(statusFilter) {
     sentSet = new Set();
   }
 
-  const orders = filtered.map(({ o, status }) => ({
-    id: o.id,
-    name: o.name || `#${o.order_number || o.id}`,
-    order_number: o.order_number,
-    created_at: o.created_at,
-    total_price: o.total_price,
-    currency: o.currency,
-    customer_name: listCustomerName(o),
-    phone: listPhone(o),
-    status,
-    alreadySent: sentSet.has(String(o.id)),
-  }));
+  const orders = filtered.map(({ o, status }) => {
+    // Lifecycle tags mean the WhatsApp/call flow already progressed:
+    // Pending is applied only after a successful confirmation send;
+    // confirmed/cancelled are final states (WhatsApp or Call tags).
+    // Without this, a Supabase outage shows "Not Sent" next to
+    // "Awaiting Confirmation" even though Shopify is already tagged.
+    const taggedLifecycle =
+      status === 'pending' ||
+      status === 'confirmed' ||
+      status === 'cancelled';
+    return {
+      id: o.id,
+      name: o.name || `#${o.order_number || o.id}`,
+      order_number: o.order_number,
+      created_at: o.created_at,
+      total_price: o.total_price,
+      currency: o.currency,
+      customer_name: listCustomerName(o),
+      phone: listPhone(o),
+      status,
+      alreadySent: sentSet.has(String(o.id)) || taggedLifecycle,
+    };
+  });
 
   return { ok: true, orders };
 }
@@ -1327,12 +1339,12 @@ async function processOrder(
     return '';
   });
 
-  // IMAGE header = product photo (enriched). Normalize protocol-relative
-  // CDN URLs. META_FALLBACK_IMAGE is used by meta.js when primary is empty
-  // or Meta rejects the product image (error 132012).
+  // IMAGE header = product photo (enriched). Convert webp Shopify CDN
+  // URLs to JPEG for Meta. META_FALLBACK_IMAGE is used when primary is
+  // empty or Meta rejects the product image (error 132012).
   const headerImageUrl =
-    normalizeImageUrl(order.productImageUrl) ||
-    normalizeImageUrl(
+    toMetaSafeImageUrl(order.productImageUrl) ||
+    toMetaSafeImageUrl(
       values.productImage ||
         values.orderPhoto ||
         (resolvers.productImage && resolvers.productImage.fn
@@ -1340,7 +1352,10 @@ async function processOrder(
           : '')
     ) ||
     '';
-  const fallbackImageUrl = normalizeImageUrl(config.meta.fallbackImage) || '';
+  const fallbackImageUrl =
+    toMetaSafeImageUrl(config.meta.fallbackImage) ||
+    normalizeImageUrl(config.meta.fallbackImage) ||
+    '';
 
   if (!headerImageUrl && !fallbackImageUrl) {
     console.warn(
