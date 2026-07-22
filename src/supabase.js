@@ -291,14 +291,17 @@ export async function hasSuccessfulLog(orderId, templateId) {
   const oid = String(orderId);
   const tid = templateId ? String(templateId) : null;
 
-  if (!client) {
-    return memory.logs.some(
-      (l) =>
-        l.shopify_order_id === oid &&
-        l.success === true &&
-        (tid ? l.template_id === tid : true)
-    );
-  }
+  // Always check in-process memory first. insertLog writes here even when
+  // Supabase is down — without this, catch-up/retry re-sends every order.
+  const memHit = memory.logs.some(
+    (l) =>
+      String(l.shopify_order_id || '') === oid &&
+      l.success === true &&
+      (tid ? String(l.template_id || '') === tid : true)
+  );
+  if (memHit) return true;
+
+  if (!client) return false;
   try {
     let q = client
       .from('message_log')
@@ -310,7 +313,12 @@ export async function hasSuccessfulLog(orderId, templateId) {
     if (error) throw error;
     return (count || 0) > 0;
   } catch (err) {
-    console.warn('[supabase] hasSuccessfulLog failed:', err.message);
+    console.warn(
+      '[supabase] hasSuccessfulLog failed (using memory only):',
+      err.message
+    );
+    // Memory already checked above — do NOT return a false-negative that
+    // would cause a duplicate WhatsApp send.
     return false;
   }
 }

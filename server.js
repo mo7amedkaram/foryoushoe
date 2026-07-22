@@ -283,6 +283,7 @@ const ADMIN_GUARDED = [
   ['POST', '/api/shopify/generate-token'],
   ['POST', '/api/shopify/test-last-order'],
   ['POST', '/api/orders/send-all'],
+  ['POST', '/api/orders/retry-failed'],
   ['POST', '/api/order-updates/run'],
   // Per-order manual send: matched by prefix (the :id is dynamic) in
   // the guard below, so it is intentionally NOT a static entry here.
@@ -1211,6 +1212,10 @@ app.post(
 // ------------------------------------------------------------
 //  Shared pipeline: resolve + send + log for a given order.
 // ------------------------------------------------------------
+
+// Prevent concurrent double-sends (webhook + catch-up cron racing).
+const inFlightConfirmSends = new Set();
+
 async function processOrder(
   order,
   { source, phoneOverride = '', skipIdempotency = false } = {}
@@ -1224,6 +1229,7 @@ async function processOrder(
   // for logging/idempotency.
   const templateName = config.meta.templateName;
   const templateId = templateName;
+  const orderIdStr = order && order.id != null ? String(order.id) : '';
 
   // Canonical body-variable order for the order_confirm* templates
   // (POSITIONAL). order_confirm_iamge has 11 (no product photo — that
@@ -1270,22 +1276,69 @@ async function processOrder(
     return { ...rec, skipped: true };
   }
 
-  // Idempotency (best effort): skip if already sent successfully.
-  // Test sends bypass this so the user can re-test freely.
-  const already = skipIdempotency
-    ? false
-    : await hasSuccessfulLog(order.id, templateId);
-  if (already) {
-    return {
-      shopify_order_id: order.id,
-      order_number: order.name || order.order_number,
-      template_id: templateId,
-      success: true,
-      skipped: true,
-      response: 'Skipped: already sent successfully for this order+template.',
-    };
+  // ---- Strong idempotency (prevents double WhatsApp messages) ----
+  // Manual/test sends may set skipIdempotency=true intentionally.
+  if (!skipIdempotency) {
+    // 1) Concurrent send already in progress (webhook vs cron race).
+    if (orderIdStr && inFlightConfirmSends.has(orderIdStr)) {
+      return {
+        shopify_order_id: order.id,
+        order_number: order.name || order.order_number,
+        template_id: templateId,
+        success: true,
+        skipped: true,
+        response:
+          'Skipped: confirmation send already in progress for this order.',
+      };
+    }
+
+    // 2) Shopify lifecycle tags — Pending is applied ONLY after a
+    //    successful send; confirmed/cancelled are final (WhatsApp or Call).
+    //    Catch-up/retry must NEVER re-send these.
+    const tagStatus = statusFromTags((order && order.tags) || '');
+    if (
+      tagStatus === 'pending' ||
+      tagStatus === 'confirmed' ||
+      tagStatus === 'cancelled'
+    ) {
+      try {
+        dequeueConfirmRetry(order.id);
+      } catch {
+        /* queue may not be ready during early boot */
+      }
+      return {
+        shopify_order_id: order.id,
+        order_number: order.name || order.order_number,
+        template_id: templateId,
+        success: true,
+        skipped: true,
+        response: `Skipped: order already ${tagStatus} (Shopify tags).`,
+      };
+    }
+
+    // 3) Successful message_log (in-memory + Supabase).
+    const already = await hasSuccessfulLog(order.id, templateId);
+    if (already) {
+      try {
+        dequeueConfirmRetry(order.id);
+      } catch {
+        /* ignore */
+      }
+      return {
+        shopify_order_id: order.id,
+        order_number: order.name || order.order_number,
+        template_id: templateId,
+        success: true,
+        skipped: true,
+        response:
+          'Skipped: already sent successfully for this order+template.',
+      };
+    }
+
+    if (orderIdStr) inFlightConfirmSends.add(orderIdStr);
   }
 
+  try {
   // Enrich from Shopify: real product image URL (-> IMAGE header) +
   // size/color in the description (المقاس/اللون). Best-effort.
   try {
@@ -1417,8 +1470,37 @@ async function processOrder(
     } catch {
       /* best effort — never affects the send result */
     }
+    // Drop any pending retries for this order.
+    try {
+      dequeueConfirmRetry(order.id);
+    } catch {
+      /* ignore */
+    }
+  } else if (
+    !sendResult.success &&
+    isRealShopifyOrderId(order.id) &&
+    source !== 'order-confirm-retry' &&
+    // Never queue a retry if tags already show a lifecycle state
+    // (would only double-message).
+    statusFromTags((order && order.tags) || '') === 'none'
+  ) {
+    // Auto-queue failed sends so they are retried until success.
+    try {
+      enqueueConfirmRetry(order.id, {
+        reason: `fail:${source || 'processOrder'}`,
+        orderNumber: order.name || order.order_number,
+      });
+    } catch {
+      /* ignore */
+    }
   }
   return rec;
+  } finally {
+    // Always release the in-flight lock.
+    if (!skipIdempotency && orderIdStr) {
+      inFlightConfirmSends.delete(orderIdStr);
+    }
+  }
 }
 
 // A real Shopify order id is a positive integer (the sample/test
@@ -2188,6 +2270,26 @@ async function processInboundWhatsAppMessage(msg) {
   }
 }
 
+// Admin: force a full catch-up + drain of failed/unsent confirmations.
+// Must be registered BEFORE the SPA fallback.
+app.post(
+  '/api/orders/retry-failed',
+  wrap(async (req, res) => {
+    const body = req.body || {};
+    const limit = Math.min(
+      Math.max(parseInt(body.limit, 10) || config.orderConfirm.batchLimit, 1),
+      100
+    );
+    // If the queue helpers are not ready yet (startup race), just run catch-up.
+    const result = await runOrderConfirmCatchUpJob({
+      source: 'manual-retry-failed',
+      limit,
+    });
+    const code = result.ok ? 200 : result.error === 'NOT_CONNECTED' ? 409 : 502;
+    res.status(code).json(result);
+  })
+);
+
 // SPA fallback -> index.html
 app.get('*', (_req, res) => {
   res.sendFile(path.join(__dirname, 'public', 'index.html'));
@@ -2240,12 +2342,153 @@ setInterval(
 );
 
 // ------------------------------------------------------------
-//  Order-confirmation catch-up cron
-//  Webhooks can be missed (HMAC mismatch, deploy blip, Shopify
-//  retry exhaustion). Periodically send confirmations for recent
-//  open orders that have no successful message_log yet.
+//  Order-confirmation catch-up + failed-send retry queue
+//  Webhooks can be missed; sends can fail (IMAGE header, token).
+//  We (1) poll open orders missing a successful log and (2) keep
+//  an in-memory retry queue with exponential backoff until success
+//  or max retries — so no order stays permanently "not sent".
 // ------------------------------------------------------------
 let orderConfirmJobRunning = false;
+
+/** @type {Map<string, { orderId: string, attempts: number, nextAt: number, reason: string, orderNumber: string }>} */
+const confirmRetryQueue = new Map();
+
+function enqueueConfirmRetry(orderId, { reason = '', orderNumber = '' } = {}) {
+  const id = String(orderId || '').trim();
+  if (!/^\d+$/.test(id)) return;
+  const prev = confirmRetryQueue.get(id);
+  const attempts = prev ? prev.attempts : 0;
+  if (attempts >= config.orderConfirm.maxRetries) {
+    console.warn(
+      `[confirm-queue] giving up on order ${orderNumber || id} after ${attempts} retries`
+    );
+    return;
+  }
+  const nextAttempts = attempts + (prev ? 0 : 0); // attempts counted on process
+  const delay =
+    config.orderConfirm.retryBaseMs *
+    Math.pow(2, Math.min(prev ? prev.attempts : 0, 5));
+  confirmRetryQueue.set(id, {
+    orderId: id,
+    attempts: prev ? prev.attempts : 0,
+    nextAt: Date.now() + (prev ? delay : 5000),
+    reason: reason || (prev && prev.reason) || 'retry',
+    orderNumber: orderNumber || (prev && prev.orderNumber) || '',
+  });
+  if (!prev) {
+    console.log(
+      `[confirm-queue] enqueued ${orderNumber || id} (${reason || 'retry'})`
+    );
+  }
+  void nextAttempts;
+}
+
+function dequeueConfirmRetry(orderId) {
+  confirmRetryQueue.delete(String(orderId || ''));
+}
+
+async function drainConfirmRetryQueue({ source = 'order-confirm-retry', limit = 20 } = {}) {
+  const now = Date.now();
+  const due = [...confirmRetryQueue.values()]
+    .filter((j) => j.nextAt <= now)
+    .sort((a, b) => a.nextAt - b.nextAt)
+    .slice(0, limit);
+
+  let attempted = 0;
+  let sent = 0;
+  let failed = 0;
+  let skipped = 0;
+  const results = [];
+
+  for (const job of due) {
+    attempted += 1;
+    job.attempts += 1;
+    try {
+      const already = await hasSuccessfulLog(job.orderId, config.meta.templateName);
+      if (already) {
+        skipped += 1;
+        dequeueConfirmRetry(job.orderId);
+        results.push({ order_id: job.orderId, skipped: true, reason: 'already_sent' });
+        continue;
+      }
+      const got = await fetchOrderById(job.orderId);
+      if (!got.ok) {
+        failed += 1;
+        job.nextAt =
+          Date.now() +
+          config.orderConfirm.retryBaseMs *
+            Math.pow(2, Math.min(job.attempts, 5));
+        if (job.attempts >= config.orderConfirm.maxRetries) {
+          confirmRetryQueue.delete(job.orderId);
+        }
+        results.push({
+          order_id: job.orderId,
+          success: false,
+          response: got.message || got.error,
+        });
+        continue;
+      }
+      const st = statusFromTags(got.order.tags);
+      if (
+        st === 'confirmed' ||
+        st === 'cancelled' ||
+        st === 'pending' ||
+        got.order.cancelled_at
+      ) {
+        skipped += 1;
+        dequeueConfirmRetry(job.orderId);
+        results.push({
+          order_id: job.orderId,
+          skipped: true,
+          reason: st || 'cancelled',
+        });
+        continue;
+      }
+      const out = await processOrder(got.order, { source });
+      if (out && out.success) {
+        sent += 1;
+        dequeueConfirmRetry(job.orderId);
+        results.push({
+          order_id: job.orderId,
+          order_number: out.order_number,
+          success: true,
+        });
+      } else if (out && out.skipped) {
+        skipped += 1;
+        dequeueConfirmRetry(job.orderId);
+        results.push({ order_id: job.orderId, skipped: true });
+      } else {
+        failed += 1;
+        job.nextAt =
+          Date.now() +
+          config.orderConfirm.retryBaseMs *
+            Math.pow(2, Math.min(job.attempts, 5));
+        job.reason = (out && out.response) || 'send failed';
+        if (job.attempts >= config.orderConfirm.maxRetries) {
+          console.warn(
+            `[confirm-queue] max retries for ${job.orderNumber || job.orderId}`
+          );
+          confirmRetryQueue.delete(job.orderId);
+        }
+        results.push({
+          order_id: job.orderId,
+          success: false,
+          response: (out && out.response) || 'send failed',
+          attempts: job.attempts,
+        });
+      }
+      await sleep(400);
+    } catch (err) {
+      failed += 1;
+      job.nextAt =
+        Date.now() +
+        config.orderConfirm.retryBaseMs * Math.pow(2, Math.min(job.attempts, 5));
+      results.push({ order_id: job.orderId, success: false, response: err.message });
+    }
+  }
+
+  return { attempted, sent, failed, skipped, queued: confirmRetryQueue.size, results };
+}
 
 async function runOrderConfirmCatchUpJob({
   source = 'order-confirm-cron',
@@ -2258,41 +2501,62 @@ async function runOrderConfirmCatchUpJob({
   const lookbackMs = config.orderConfirm.lookbackHours * 60 * 60 * 1000;
   const cutoff = Date.now() - lookbackMs;
 
-  // Prefer open unfulfilled/partial orders created recently. status=any
-  // + client filter so we also catch paid-but-not-yet-tagged ones.
-  const fetched = await adminApiGet(
-    'orders.json?status=open&limit=50&order=created_at+desc&fields=' +
-      encodeURIComponent(
-        'id,name,order_number,created_at,cancelled_at,phone,customer,' +
-          'shipping_address,billing_address,line_items,total_price,currency,' +
-          'financial_status,fulfillment_status,tags'
-      )
+  // Open orders first (up to 100), then also scan status=any for
+  // recent ones that may still need a confirmation message.
+  const fields =
+    'id,name,order_number,created_at,cancelled_at,phone,customer,' +
+    'shipping_address,billing_address,line_items,total_price,currency,' +
+    'financial_status,fulfillment_status,tags';
+
+  const fetchedOpen = await adminApiGet(
+    'orders.json?status=open&limit=100&order=created_at+desc&fields=' +
+      encodeURIComponent(fields)
   );
-  if (!fetched.ok) {
+  if (!fetchedOpen.ok) {
     return {
       ok: false,
-      error: fetched.error || 'FETCH_FAILED',
-      message: fetched.message || 'Could not fetch open orders for confirm catch-up.',
-      status: fetched.status,
+      error: fetchedOpen.error || 'FETCH_FAILED',
+      message:
+        fetchedOpen.message ||
+        'Could not fetch open orders for confirm catch-up.',
+      status: fetchedOpen.status,
       scanned: 0,
       attempted: 0,
       sent: 0,
       failed: 0,
       skipped: 0,
+      queued: confirmRetryQueue.size,
     };
   }
 
+  const byId = new Map();
+  for (const o of (fetchedOpen.data && fetchedOpen.data.orders) || []) {
+    if (o && o.id) byId.set(String(o.id), o);
+  }
+  // Extra page of any-status recent orders (covers edge cases).
+  const fetchedAny = await adminApiGet(
+    'orders.json?status=any&limit=50&order=created_at+desc&fields=' +
+      encodeURIComponent(fields)
+  );
+  if (fetchedAny.ok) {
+    for (const o of (fetchedAny.data && fetchedAny.data.orders) || []) {
+      if (o && o.id && !byId.has(String(o.id))) byId.set(String(o.id), o);
+    }
+  }
+
   const templateName = config.meta.templateName;
-  const all = Array.isArray(fetched.data && fetched.data.orders)
-    ? fetched.data.orders
-    : [];
+  const all = [...byId.values()];
   const candidates = all.filter((o) => {
     if (!o || o.cancelled_at) return false;
     const created = Date.parse(o.created_at || '') || 0;
     if (created && created < cutoff) return false;
-    // Skip already confirmed / cancelled via WhatsApp tags.
+    // Skip ANY lifecycle tag. Pending is set only after a successful
+    // confirmation send — re-including pending was the main cause of
+    // customers receiving the same order message twice.
     const st = statusFromTags(o.tags);
-    if (st === 'confirmed' || st === 'cancelled') return false;
+    if (st === 'confirmed' || st === 'cancelled' || st === 'pending') {
+      return false;
+    }
     return true;
   });
 
@@ -2308,6 +2572,7 @@ async function runOrderConfirmCatchUpJob({
       const already = await hasSuccessfulLog(order.id, templateName);
       if (already) {
         skipped += 1;
+        dequeueConfirmRetry(order.id);
         continue;
       }
       attempted += 1;
@@ -2327,32 +2592,49 @@ async function runOrderConfirmCatchUpJob({
         });
       } else {
         failed += 1;
+        enqueueConfirmRetry(order.id, {
+          reason: (out && out.response) || 'send failed',
+          orderNumber: order.name || order.order_number,
+        });
         results.push({
           order_number: order.name || order.order_number,
           success: false,
           response: (out && out.response) || 'send failed',
+          queued: true,
         });
       }
       // Gentle pacing for Meta + Shopify rate limits.
-      await sleep(400);
+      await sleep(450);
     } catch (err) {
       failed += 1;
+      enqueueConfirmRetry(order.id, {
+        reason: err.message,
+        orderNumber: order.name || order.order_number,
+      });
       results.push({
         order_number: order.name || order.order_number,
         success: false,
         response: err.message,
+        queued: true,
       });
     }
   }
 
+  // Drain due retries from earlier failures.
+  const drain = await drainConfirmRetryQueue({
+    source: source + '+retry',
+    limit: Math.max(5, Math.floor(cap / 2)),
+  });
+
   return {
     ok: true,
     scanned: candidates.length,
-    attempted,
-    sent,
-    failed,
-    skipped,
-    results,
+    attempted: attempted + drain.attempted,
+    sent: sent + drain.sent,
+    failed: failed + drain.failed,
+    skipped: skipped + drain.skipped,
+    queued: confirmRetryQueue.size,
+    results: results.concat(drain.results || []),
   };
 }
 
@@ -2366,10 +2648,10 @@ async function runScheduledOrderConfirmJob() {
         `[order-confirm-cron] skipped: ${r.error || 'FETCH_FAILED'} ` +
           `${r.message || ''}`.trim()
       );
-    } else if (r.attempted || r.failed || config.debug) {
+    } else if (r.attempted || r.failed || r.queued || config.debug) {
       console.log(
         `[order-confirm-cron] scanned=${r.scanned} attempted=${r.attempted} ` +
-          `sent=${r.sent} failed=${r.failed} skipped=${r.skipped}`
+          `sent=${r.sent} failed=${r.failed} skipped=${r.skipped} queued=${r.queued}`
       );
     }
   } catch (err) {
@@ -2383,11 +2665,12 @@ if (config.orderConfirm.cronEnabled) {
   const interval = config.orderConfirm.cronIntervalMs;
   console.log(
     `  Order confirm cron: enabled every ${Math.round(interval / 1000)}s ` +
-      `(template=${config.meta.templateName}, lookback=${config.orderConfirm.lookbackHours}h)`
+      `(template=${config.meta.templateName}, lookback=${config.orderConfirm.lookbackHours}h, ` +
+      `maxRetries=${config.orderConfirm.maxRetries})`
   );
   setInterval(runScheduledOrderConfirmJob, interval);
   // First catch-up shortly after boot (give token keepalive a moment).
-  setTimeout(runScheduledOrderConfirmJob, 15000);
+  setTimeout(runScheduledOrderConfirmJob, 10000);
 } else {
   console.log('  Order confirm cron: disabled');
 }
