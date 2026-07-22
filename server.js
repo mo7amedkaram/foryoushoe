@@ -11,6 +11,7 @@ import { fileURLToPath } from 'node:url';
 import { config } from './src/config.js';
 import {
   isSupabaseEnabled,
+  checkSupabaseHealth,
   getConfig,
   saveConfig,
   insertLog,
@@ -21,14 +22,22 @@ import {
   confirmClaimKey,
   webhookClaimKey,
   inboundClaimKey,
-  inquiryClaimKey,
+  inquiryItemClaimKey,
   tryAcquireSendClaim,
   completeSendClaim,
-  findRecentOrderByPhone,
+  findOrderByReplyMessageId,
+  findSendClaimByMessageId,
+  findUnambiguousOrderByPhone,
+  hasMessageAttempt,
   phoneDigitVariants,
   getShopifyAuth,
   saveShopifyAuth,
 } from './src/supabase.js';
+import {
+  extractInboundLabel,
+  resolveInboundOrderReference,
+  deliverInquiry,
+} from './src/inquiry.js';
 import { listTemplates } from './src/joud.js';
 import {
   isMetaConfigured,
@@ -38,7 +47,6 @@ import {
   getPhoneNumbers as metaGetPhoneNumbers,
   listTemplatesMeta,
   getTemplateMeta,
-  normalizeImageUrl,
   toMetaSafeImageUrl,
   uploadImageToMeta,
 } from './src/meta.js';
@@ -63,6 +71,7 @@ import {
   cancelShopifyOrder,
   markOrderPending,
   getOrderItemsDetailed,
+  checkShopifyProductAccess,
   enrichOrderFromShopify,
   fetchProductImageUrl,
   normalizeShopifyImageUrl,
@@ -321,9 +330,28 @@ app.use((req, res, next) => {
 app.get(
   '/api/health',
   wrap(async (_req, res) => {
-    res.json({
-      ok: true,
-      supabase: isSupabaseEnabled(),
+    const [persistence, shopifyProducts] = await Promise.all([
+      checkSupabaseHealth({ force: true }),
+      checkShopifyProductAccess(),
+    ]);
+    const ok = persistence.healthy && shopifyProducts.healthy;
+    res.status(ok ? 200 : 503).json({
+      ok,
+      supabase: persistence,
+      shopifyProducts: {
+        healthy: shopifyProducts.healthy,
+        status: shopifyProducts.status,
+        error: shopifyProducts.error,
+        checkedAt: shopifyProducts.checkedAt
+          ? new Date(shopifyProducts.checkedAt).toISOString()
+          : null,
+      },
+      listener: { host: '::', port: config.port },
+      workers: {
+        orderConfirm: config.orderConfirm.cronEnabled,
+        orderConfirmAutoRetry: false,
+        orderUpdates: config.orderUpdates.cronEnabled,
+      },
       time: new Date().toISOString(),
     });
   })
@@ -648,8 +676,20 @@ app.post(
 app.get(
   '/api/shopify/status',
   wrap(async (_req, res) => {
+    const productAccess = await checkShopifyProductAccess();
     const auth = await getShopifyAuth();
     const expMs = auth && auth.expires_at ? Date.parse(auth.expires_at) : NaN;
+    const scopeKnown = Boolean(auth && auth.scope && auth.scope !== 'static');
+    const grantedScopes = new Set(
+      String((auth && auth.scope) || '')
+        .split(',')
+        .map((scope) => scope.trim())
+        .filter(Boolean)
+    );
+    const requiredScopes = OAUTH_SCOPES.split(',');
+    const missingScopes = scopeKnown
+      ? requiredScopes.filter((scope) => !grantedScopes.has(scope))
+      : [];
     res.json({
       ok: true,
       connected: Boolean(auth && auth.access_token),
@@ -659,6 +699,11 @@ app.get(
       expires_at: (auth && auth.expires_at) || null,
       expired: Number.isFinite(expMs) ? expMs <= Date.now() : null,
       requiredScopes: OAUTH_SCOPES,
+      scopeKnown,
+      missingScopes,
+      exactVariantImagesAvailable: productAccess.healthy,
+      productReadStatus: productAccess.status,
+      productReadError: productAccess.error,
     });
   })
 );
@@ -1316,11 +1361,6 @@ async function processOrder(
       tagStatus === 'confirmed' ||
       tagStatus === 'cancelled'
     ) {
-      try {
-        dequeueConfirmRetry(order.id);
-      } catch {
-        /* queue may not be ready during early boot */
-      }
       return {
         shopify_order_id: order.id,
         order_number: order.name || order.order_number,
@@ -1334,11 +1374,6 @@ async function processOrder(
     // 3) Successful message_log / permanent claim (in-memory + Supabase).
     const already = await hasSuccessfulLog(order.id, templateId);
     if (already) {
-      try {
-        dequeueConfirmRetry(order.id);
-      } catch {
-        /* ignore */
-      }
       return {
         shopify_order_id: order.id,
         order_number: order.name || order.order_number,
@@ -1360,16 +1395,11 @@ async function processOrder(
         templateId,
       });
       if (!acq.acquired) {
-        try {
-          dequeueConfirmRetry(order.id);
-        } catch {
-          /* ignore */
-        }
         return {
           shopify_order_id: order.id,
           order_number: order.name || order.order_number,
           template_id: templateId,
-          success: true,
+          success: acq.reason === 'already_sent',
           skipped: true,
           response: `Skipped: send claim not acquired (${acq.reason || 'duplicate'}).`,
         };
@@ -1440,9 +1470,8 @@ async function processOrder(
     return '';
   });
 
-  // IMAGE header = product photo (enriched). Convert webp Shopify CDN
-  // URLs to JPEG for Meta. META_FALLBACK_IMAGE is used when primary is
-  // empty or Meta rejects the product image (error 132012).
+  // IMAGE header = the exact product photo resolved from Shopify. Product
+  // messages never fall back to a brand asset or a different variant.
   const headerImageUrl =
     toMetaSafeImageUrl(order.productImageUrl) ||
     toMetaSafeImageUrl(
@@ -1453,15 +1482,10 @@ async function processOrder(
           : '')
     ) ||
     '';
-  const fallbackImageUrl =
-    toMetaSafeImageUrl(config.meta.fallbackImage) ||
-    normalizeImageUrl(config.meta.fallbackImage) ||
-    '';
-
-  if (!headerImageUrl && !fallbackImageUrl) {
+  if (!headerImageUrl) {
     console.warn(
       `[processOrder] #${order.name || order.order_number}: no product image ` +
-        `and META_FALLBACK_IMAGE is empty — IMAGE header templates will fail.`
+        '— refusing to substitute a brand or unrelated product image.'
     );
   }
 
@@ -1473,7 +1497,6 @@ async function processOrder(
       languageCode: config.meta.templateLang,
       orderedValues,
       headerImageUrl,
-      fallbackImageUrl,
       forceImageHeader: true,
     });
     sendResult = {
@@ -1481,13 +1504,8 @@ async function processOrder(
       httpStatus: m.httpStatus,
       messageId: m.messageId || null,
       raw: m.messageId ? `msg ${m.messageId} :: ${m.raw}` : m.raw,
-      headerImageUsed: m.headerImageUsed || headerImageUrl || fallbackImageUrl,
-      retriedWithFallback: Boolean(m.retriedWithFallback),
+      headerImageUsed: m.headerImageUsed || headerImageUrl,
     };
-    if (m.retriedWithFallback) {
-      sendResult.raw =
-        `${sendResult.raw} :: retried_with_fallback after: ${m.primaryImageError || ''}`;
-    }
   } catch (err) {
     sendResult = {
       success: false,
@@ -1504,17 +1522,18 @@ async function processOrder(
     template_id: templateId,
     variables: {
       ...values,
+      __providerMessageId: sendResult.messageId || null,
       __headerImage: sendResult.headerImageUsed || headerImageUrl,
       __headerImagePrimary: headerImageUrl,
-      __headerImageFallback: fallbackImageUrl,
     },
     success: sendResult.success,
+    messageId: sendResult.messageId || null,
     response: `[${source}] HTTP ${sendResult.httpStatus} :: ${sendResult.raw}`,
   };
   await insertLog(rec);
 
-  // Finalize durable claim: success = permanent "sent"; failure releases
-  // so a later retry/catch-up can re-acquire.
+  // Finalize the durable claim. Both success and failure are terminal so an
+  // uncertain provider outcome can never be replayed automatically.
   if (claimAcquired && claimKey) {
     try {
       await completeSendClaim(claimKey, {
@@ -1537,29 +1556,6 @@ async function processOrder(
       await markOrderPending(order.id);
     } catch {
       /* best effort — never affects the send result */
-    }
-    // Drop any pending retries for this order.
-    try {
-      dequeueConfirmRetry(order.id);
-    } catch {
-      /* ignore */
-    }
-  } else if (
-    !sendResult.success &&
-    isRealShopifyOrderId(order.id) &&
-    source !== 'order-confirm-retry' &&
-    // Never queue a retry if tags already show a lifecycle state
-    // (would only double-message).
-    statusFromTags((order && order.tags) || '') === 'none'
-  ) {
-    // Auto-queue failed sends so they are retried until success.
-    try {
-      enqueueConfirmRetry(order.id, {
-        reason: `fail:${source || 'processOrder'}`,
-        orderNumber: order.name || order.order_number,
-      });
-    } catch {
-      /* ignore */
     }
   }
   return rec;
@@ -1739,17 +1735,17 @@ async function processOrderUpdate(
     return rec;
   }
 
-  const already = skipIdempotency
+  const attemptedBefore = skipIdempotency
     ? false
-    : await hasSuccessfulLog(order.id, templateName);
-  if (already) {
+    : await hasMessageAttempt(order.id, templateName);
+  if (attemptedBefore) {
     return {
       shopify_order_id: order.id,
       order_number: order.name || order.order_number,
       template_id: templateName,
       success: true,
       skipped: true,
-      response: 'Skipped: order_update already sent successfully for this order.',
+      response: 'Skipped: order_update already has a terminal send attempt.',
     };
   }
 
@@ -1766,6 +1762,28 @@ async function processOrderUpdate(
     };
     if (logIneligible) await insertLog(rec);
     return rec;
+  }
+
+  const claimKey = confirmClaimKey(order.id, templateName);
+  let claimAcquired = false;
+  if (!skipIdempotency) {
+    const claim = await tryAcquireSendClaim({
+      claimKey,
+      kind: 'order_update',
+      shopifyOrderId: order.id,
+      templateId: templateName,
+    });
+    if (!claim.acquired) {
+      return {
+        shopify_order_id: order.id,
+        order_number: order.name || order.order_number,
+        template_id: templateName,
+        success: false,
+        skipped: true,
+        response: `Skipped: order_update claim not acquired (${claim.reason}).`,
+      };
+    }
+    claimAcquired = true;
   }
 
   const liveTemplate = templateMeta || (await getOrderUpdateTemplateMeta());
@@ -1795,6 +1813,7 @@ async function processOrderUpdate(
     sendResult = {
       success: m.success,
       httpStatus: m.httpStatus,
+      messageId: m.messageId || null,
       raw: m.messageId ? `msg ${m.messageId} :: ${m.raw}` : m.raw,
     };
   } catch (err) {
@@ -1818,6 +1837,13 @@ async function processOrderUpdate(
     response: `[${source || 'order-update'}] HTTP ${sendResult.httpStatus} :: ${sendResult.raw}`,
   };
   await insertLog(rec);
+  if (claimAcquired) {
+    await completeSendClaim(claimKey, {
+      success: Boolean(sendResult.success),
+      messageId: sendResult.messageId || null,
+      response: rec.response,
+    });
+  }
   return rec;
 }
 
@@ -1976,6 +2002,14 @@ app.post(
       return res.status(401).json({ ok: false, error: 'HMAC verification failed' });
     }
 
+    const persistence = await checkSupabaseHealth();
+    if (!persistence.healthy) {
+      return res.status(503).json({
+        ok: false,
+        error: 'durable idempotency unavailable',
+      });
+    }
+
     // 1b. Webhook-event idempotency: Shopify may redeliver the same
     //     delivery (timeouts, 5xx). Claim the webhook id first so
     //     retries never re-enter processOrder.
@@ -1986,6 +2020,12 @@ app.post(
         webhookId: shopifyWebhookId,
       });
       if (!whClaim.acquired) {
+        if (whClaim.reason === 'persistence_unavailable') {
+          return res.status(503).json({
+            ok: false,
+            error: 'durable idempotency unavailable',
+          });
+        }
         console.log(
           `[webhook] duplicate delivery ${shopifyWebhookId} skipped (${whClaim.reason})`
         );
@@ -2035,12 +2075,10 @@ app.post(
       });
       if (shopifyWebhookId) {
         // Mark this Shopify *delivery* as handled so retries of the same
-        // X-Shopify-Webhook-Id never re-enter the pipeline. Soft send
-        // failures are retried by the confirm claim + catch-up, not by
-        // replaying the webhook.
+        // X-Shopify-Webhook-Id never re-enter the pipeline. Provider failures
+        // remain terminal; only a new explicit operator action may resend.
         await completeSendClaim(webhookClaimKey(shopifyWebhookId), {
           success: true,
-          messageId: (result && result.messageId) || null,
           response: (result && result.response) || 'processed',
         });
       }
@@ -2076,6 +2114,14 @@ async function handleShopifyOrderUpdateWebhook(req, res, source) {
   if (!valid) {
     console.warn(`[${source}] HMAC verification FAILED.`);
     return res.status(401).json({ ok: false, error: 'HMAC verification failed' });
+  }
+
+  const persistence = await checkSupabaseHealth();
+  if (!persistence.healthy) {
+    return res.status(503).json({
+      ok: false,
+      error: 'durable idempotency unavailable',
+    });
   }
 
   let order;
@@ -2159,9 +2205,6 @@ app.get(
 app.post(
   '/webhooks/whatsapp',
   wrap(async (req, res) => {
-    // Always 200 fast so Meta does not disable the webhook.
-    res.status(200).json({ ok: true });
-
     // Reject forged payloads: an unverified caller must not be able
     // to drive Shopify writes / outbound WhatsApp via fake button taps.
     if (!verifyMetaSignature(req)) {
@@ -2171,8 +2214,20 @@ app.post(
           `header=${(req.get('x-hub-signature-256') || '').slice(0, 20)}… ` +
           'Check META_APP_SECRET matches the Meta app subscribed to this WABA.'
       );
-      return;
+      return res.status(401).json({ ok: false, error: 'invalid signature' });
     }
+
+    const persistence = await checkSupabaseHealth();
+    if (!persistence.healthy) {
+      return res.status(503).json({
+        ok: false,
+        error: 'durable idempotency unavailable',
+      });
+    }
+
+    // Acknowledge before the sequential image sends; durable per-message and
+    // per-line-item claims make any callback redelivery harmless.
+    res.status(200).json({ ok: true });
 
     try {
       const body = req.body || {};
@@ -2197,6 +2252,9 @@ app.post(
             const status = st && st.status; // sent|delivered|read|failed
             const msgId = st && st.id;
             const recipient = st && st.recipient_id;
+            const sendClaim = msgId
+              ? await findSendClaimByMessageId(msgId)
+              : null;
             const errs = Array.isArray(st && st.errors) ? st.errors : [];
             const errText = errs
               .map(
@@ -2219,11 +2277,18 @@ app.post(
             // real error code instead of a misleading "success".
             if (status === 'failed') {
               await insertLog({
-                shopify_order_id: null,
+                shopify_order_id:
+                  (sendClaim && sendClaim.shopify_order_id) || null,
                 order_number: null,
                 recipient_phone: recipient || null,
-                template_id: null,
-                variables: {},
+                template_id: (sendClaim && sendClaim.template_id) || null,
+                variables: {
+                  action: 'delivery_status',
+                  providerMessageId: msgId || null,
+                  deliveryStatus: status || null,
+                  claimKey: (sendClaim && sendClaim.claim_key) || null,
+                  claimKind: (sendClaim && sendClaim.kind) || null,
+                },
                 success: false,
                 response:
                   `[whatsapp-status] DELIVERY FAILED for msg ${msgId || '?'}` +
@@ -2238,18 +2303,6 @@ app.post(
               await processInboundWhatsAppMessage(m);
             } catch (e) {
               console.error('[whatsapp-inbound] error:', e.message, e.stack);
-              // Never leave the customer with total silence on a button tap.
-              try {
-                const from = String((m && m.from) || '').replace(/\D/g, '');
-                if (from) {
-                  await metaSendText({
-                    to: from,
-                    text: 'حصلت مشكلة مؤقتة، جرّبي تاني خلال لحظات أو ابعتي «استفسار» 🙏',
-                  });
-                }
-              } catch {
-                /* ignore */
-              }
             }
           }
         }
@@ -2266,39 +2319,11 @@ app.post(
 //  Restored from the original working bridge (commit a5d5bad) with
 //  only reliability fixes that preserve the exact customer-facing
 //  behavior for «أحتاج الي استفسار»:
-//    1) find order by phone (message_log + Shopify fallback)
-//    2) fetch that Shopify order
-//    3) getOrderItemsDetailed → every line item size/color/image
-//    4) text intro + one image message per item (caption = details)
+//    1) resolve context.id to the exact sent confirmation claim
+//    2) verify the sender matches that Shopify order's phone
+//    3) map every line_item by product_id + variant_id
+//    4) text intro + one exact variant image/caption per item
 // ------------------------------------------------------------
-
-function extractInboundLabel(msg) {
-  if (!msg || typeof msg !== 'object') return '';
-  // Original path: button quick-reply OR interactive button_reply.
-  if (msg.type === 'button' && msg.button) {
-    return String(msg.button.text || msg.button.payload || '').trim();
-  }
-  if (
-    msg.type === 'interactive' &&
-    msg.interactive &&
-    msg.interactive.button_reply
-  ) {
-    const br = msg.interactive.button_reply;
-    return String(br.title || br.id || '').trim();
-  }
-  // Alternate payload shapes Meta sometimes sends.
-  if (msg.button) {
-    return String(msg.button.text || msg.button.payload || '').trim();
-  }
-  if (msg.interactive && msg.interactive.button_reply) {
-    const br = msg.interactive.button_reply;
-    return String(br.title || br.id || '').trim();
-  }
-  if (msg.type === 'text' && msg.text && msg.text.body) {
-    return String(msg.text.body).trim();
-  }
-  return '';
-}
 
 // Match Shopify order phone fields against inbound WhatsApp "from".
 function orderPhoneMatches(order, fromDigits) {
@@ -2320,31 +2345,6 @@ function orderPhoneMatches(order, fromDigits) {
   return false;
 }
 
-// Original: findRecentOrderByPhone only. Keep that first; add Shopify
-// fallback so multi-instance / missing logs still resolve the order.
-async function resolveOrderIdForInboundPhone(from) {
-  const fromLog = await findRecentOrderByPhone(from);
-  if (fromLog && /^\d+$/.test(String(fromLog))) return String(fromLog);
-
-  try {
-    const fields =
-      'id,name,order_number,phone,customer,shipping_address,billing_address,created_at,cancelled_at,line_items,tags';
-    const r = await adminApiGet(
-      'orders.json?status=any&limit=50&order=created_at+desc&fields=' +
-        encodeURIComponent(fields)
-    );
-    if (r.ok && r.data && Array.isArray(r.data.orders)) {
-      for (const o of r.data.orders) {
-        if (!o || o.cancelled_at) continue;
-        if (orderPhoneMatches(o, from)) return String(o.id);
-      }
-    }
-  } catch (err) {
-    console.warn('[whatsapp-inbound] Shopify phone lookup failed:', err.message);
-  }
-  return fromLog ? String(fromLog) : null;
-}
-
 async function processInboundWhatsAppMessage(msg) {
   if (!msg || typeof msg !== 'object') return;
   const from = String(msg.from || '').replace(/\D/g, '');
@@ -2353,6 +2353,10 @@ async function processInboundWhatsAppMessage(msg) {
   // Dedup Meta redeliveries of the exact same wamid only (do NOT block
   // a new tap of the same button — original never blocked re-taps).
   const waMsgId = msg.id ? String(msg.id) : '';
+  if (!waMsgId) {
+    console.warn('[whatsapp-inbound] ignored message without a provider id');
+    return;
+  }
   if (waMsgId) {
     const inClaim = await tryAcquireSendClaim({
       claimKey: inboundClaimKey(waMsgId),
@@ -2377,9 +2381,29 @@ async function processInboundWhatsAppMessage(msg) {
     return; // plain text/other inbound — ignore (original behavior)
   }
 
-  const orderId = await resolveOrderIdForInboundPhone(from);
+  const orderReference = await resolveInboundOrderReference(msg, {
+    findByReplyMessageId: findOrderByReplyMessageId,
+    findUnambiguousByPhone: findUnambiguousOrderByPhone,
+  });
+  let orderId = orderReference.orderId;
+  let correlatedOrder = null;
+  if (orderId) {
+    const fetched = await fetchOrderById(orderId);
+    if (fetched.ok && orderPhoneMatches(fetched.order, from)) {
+      correlatedOrder = fetched.order;
+    } else {
+      console.warn(
+        `[whatsapp-inbound] rejected order correlation order=${orderId} ` +
+          `source=${orderReference.source} phone_match=${Boolean(
+            fetched.ok && orderPhoneMatches(fetched.order, from)
+          )}`
+      );
+      orderId = null;
+    }
+  }
   console.log(
-    `[whatsapp-inbound] from ${from} tapped "${label}" (order ${orderId || '?'}) wamid=${waMsgId || '-'}`
+    `[whatsapp-inbound] from ${from} tapped "${label}" ` +
+      `(order ${orderId || '?'} via ${orderReference.source}) wamid=${waMsgId || '-'}`
   );
 
   // ---- Confirm order (original regex) ----
@@ -2430,173 +2454,68 @@ async function processInboundWhatsAppMessage(msg) {
     return;
   }
 
-  // ---- Need inquiry -> send all products' images + details ----
-  // Original regex from a5d5bad: /استفسار|inquiry|تعديل/i
-  // Extended slightly so «أحتاج الي استفسار» always matches.
-  if (/استفسار|inquiry|تعديل|أحتاج|احتاج/i.test(label)) {
-    if (!orderId) {
+  // ---- Need inquiry -> send every exact variant image + description ----
+  if (
+    /\u0627\u0633\u062a\u0641\u0633\u0627\u0631|inquiry|\u062a\u0639\u062f\u064a\u0644|(?:\u0623|\u0627)\u062d\u062a\u0627\u062c/i.test(
+      label
+    )
+  ) {
+    if (!orderId || !correlatedOrder) {
       await metaSendText({
         to: from,
-        text: 'لم نتمكن من ربط رقمك بطلب حديث. تواصل معنا من فضلك 🙏',
-      });
-      if (waMsgId) {
-        await completeSendClaim(inboundClaimKey(waMsgId), {
-          success: true,
-          response: 'inquiry no order',
-        });
-      }
-      return;
-    }
-
-    const got = await fetchOrderById(orderId);
-    if (!got.ok) {
-      await metaSendText({
-        to: from,
-        text: 'تعذّر جلب تفاصيل الطلب حاليًا، حاول لاحقًا 🙏',
+        text: '\u0644\u0645 \u0646\u062a\u0645\u0643\u0646 \u0645\u0646 \u0631\u0628\u0637 \u0631\u0642\u0645\u0643 \u0628\u0637\u0644\u0628 \u062d\u062f\u064a\u062b. \u062a\u0648\u0627\u0635\u0644 \u0645\u0639\u0646\u0627 \u0645\u0646 \u0641\u0636\u0644\u0643 \ud83d\ude4f',
       });
       if (waMsgId) {
         await completeSendClaim(inboundClaimKey(waMsgId), {
           success: false,
-          response: got.message || 'fetch failed',
+          response: 'inquiry correlation rejected',
         });
       }
       return;
     }
 
-    // Exact original pipeline:
-    // getOrderItemsDetailed → intro text → image-per-item with caption
-    const items = await getOrderItemsDetailed(got.order);
-    if (!items.length) {
-      await metaSendText({ to: from, text: 'لا توجد أصناف في هذا الطلب.' });
-      if (waMsgId) {
-        await completeSendClaim(inboundClaimKey(waMsgId), {
-          success: true,
-          response: 'inquiry no items',
-        });
-      }
-      return;
-    }
+    const requestId = waMsgId;
+    const claimFor = (identity) =>
+      inquiryItemClaimKey(orderId, requestId, identity);
+    const acquireItemClaim = (identity) =>
+      tryAcquireSendClaim({
+        claimKey: claimFor(identity),
+        kind: 'inquiry_item',
+        shopifyOrderId: orderId,
+      });
+    const completeItemClaim = (identity, result) =>
+      completeSendClaim(claimFor(identity), {
+        success: Boolean(result.success),
+        messageId: result.messageId || null,
+        response:
+          `terminal inquiry delivery success=${Boolean(result.success)} ` +
+          String(result.raw || '').slice(0, 1000),
+      });
 
-    const MAX_SEND = 10; // original cap
-    const toSend = items.slice(0, MAX_SEND);
-    const intro = await metaSendText({
-      to: from,
-      text: `تفاصيل منتجات طلبك (${items.length} صنف) 👇`,
-    });
-    console.log(
-      `[whatsapp-inbound] inquiry intro ok=${Boolean(intro && intro.success)} ` +
-        `items=${items.length} order=${got.order.name || orderId}`
+    const delivery = await deliverInquiry(
+      {
+        orderId,
+        orderNumber: correlatedOrder.name || correlatedOrder.order_number,
+        recipientPhone: from,
+        requestId,
+        replyToMessageId: orderReference.replyMessageId,
+        buttonLabel: label,
+        acquireItemClaim,
+        completeItemClaim,
+        insertLog,
+        sendImage: metaSendImage,
+        sendText: metaSendText,
+        afterEach: () => sleep(500),
+      },
+      await getOrderItemsDetailed(correlatedOrder)
     );
 
-    let sent = 0;
-    let imagesSent = 0;
-    for (let i = 0; i < toSend.length; i++) {
-      const it = toSend[i];
-      const parts = [`${it.qty}x ${it.title}`];
-      if (it.size) parts.push(`المقاس : ${it.size}`);
-      if (it.color) parts.push(`اللون : ${it.color}`);
-      const caption = `(${i + 1}/${items.length}) ${parts.join(' - ')}`;
-      let r;
-      // Prefer product image; fall back to brand image so multi-item
-      // orders never drop the 2nd+ product image (order #5633 pattern).
-      let imageUrl =
-        toMetaSafeImageUrl(it.imageUrl) ||
-        normalizeImageUrl(it.imageUrl) ||
-        toMetaSafeImageUrl(config.meta.fallbackImage) ||
-        normalizeImageUrl(config.meta.fallbackImage) ||
-        '';
-
-      if (imageUrl && /^https?:\/\//i.test(imageUrl)) {
-        // sendImageMessage: media-upload first (reliable for webp), then link.
-        r = await metaSendImage({ to: from, imageUrl, caption });
-        if (r && r.success) {
-          imagesSent += 1;
-        } else {
-          console.warn(
-            `[whatsapp-inbound] image fail item ${i + 1}/${items.length}: ${String(
-              (r && r.raw) || ''
-            ).slice(0, 300)}`
-          );
-          // One more try with fallback brand image if we used product URL.
-          const fb =
-            toMetaSafeImageUrl(config.meta.fallbackImage) ||
-            normalizeImageUrl(config.meta.fallbackImage) ||
-            '';
-          if (fb && fb !== imageUrl) {
-            r = await metaSendImage({ to: from, imageUrl: fb, caption });
-            if (r && r.success) {
-              imagesSent += 1;
-              imageUrl = fb;
-            }
-          }
-          if (!r || !r.success) {
-            // Last resort: details as text (should be rare now).
-            r = await metaSendText({ to: from, text: caption });
-          }
-        }
-      } else {
-        r = await metaSendText({ to: from, text: caption });
-      }
-      if (r && r.success) sent += 1;
-      console.log(
-        `[whatsapp-inbound] item ${i + 1}/${items.length} success=${Boolean(
-          r && r.success
-        )} msg=${(r && r.messageId) || '-'} image=${Boolean(imageUrl)} media=${
-          (r && r.mediaId) || '-'
-        }`
-      );
-      await insertLog({
-        shopify_order_id: orderId,
-        order_number: got.order.name || got.order.order_number,
-        recipient_phone: from,
-        template_id: null,
-        variables: {
-          action: 'inquiry_item',
-          index: i + 1,
-          title: it.title,
-          size: it.size,
-          color: it.color,
-          imageUrl: imageUrl || null,
-          mediaId: (r && r.mediaId) || null,
-        },
-        success: Boolean(r && r.success),
-        response: `[inbound] inquiry item ${i + 1}/${items.length} :: HTTP ${
-          (r && r.httpStatus) || 0
-        } :: msg ${(r && r.messageId) || '-'} :: media ${
-          (r && r.mediaId) || '-'
-        } :: ${String((r && r.raw) || '').slice(0, 400)}`,
-      });
-      // Pace free-form messages — Meta is more reliable with a short gap
-      // between multi-item image bursts (2+ products).
-      await sleep(500);
-    }
-
-    if (items.length > MAX_SEND) {
-      await metaSendText({
-        to: from,
-        text: `وباقي المنتجات (${items.length - MAX_SEND}) — لو محتاج صورها تواصل معنا 🙏`,
-      });
-    }
-
-    await insertLog({
-      shopify_order_id: orderId,
-      order_number: got.order.name || got.order.order_number,
-      recipient_phone: from,
-      template_id: null,
-      variables: {
-        action: 'inquiry',
-        items: items.length,
-        sent,
-        imagesSent,
-        button: label,
-      },
-      success: sent > 0,
-      response: `[inbound] inquiry -> sent ${sent}/${items.length} product messages (${imagesSent} with images)`,
-    });
     if (waMsgId) {
       await completeSendClaim(inboundClaimKey(waMsgId), {
-        success: sent > 0,
-        response: `inquiry sent=${sent} images=${imagesSent}`,
+        success: Boolean(delivery.allSucceeded),
+        response:
+          `inquiry result=${delivery.reason} sent=${delivery.sent} ` +
+          `images=${delivery.imagesSent} skipped=${delivery.skipped}`,
       });
     }
     return;
@@ -2658,7 +2577,7 @@ async function processInboundWhatsAppMessage(msg) {
 }
 
 
-// Admin: force a full catch-up + drain of failed/unsent confirmations.
+// Admin: scan recent orders and send only those with no prior attempt.
 // Must be registered BEFORE the SPA fallback.
 app.post(
   '/api/orders/retry-failed',
@@ -2668,9 +2587,8 @@ app.post(
       Math.max(parseInt(body.limit, 10) || config.orderConfirm.batchLimit, 1),
       100
     );
-    // If the queue helpers are not ready yet (startup race), just run catch-up.
     const result = await runOrderConfirmCatchUpJob({
-      source: 'manual-retry-failed',
+      source: 'manual-unsent-scan',
       limit,
     });
     const code = result.ok ? 200 : result.error === 'NOT_CONNECTED' ? 409 : 502;
@@ -2691,10 +2609,14 @@ process.on('uncaughtException', (err) => {
   console.error('[uncaughtException]', err);
 });
 
-const server = app.listen(config.port, () => {
+const server = app.listen(config.port, '::', () => {
   console.log(`\n  Shopify <-> WhatsApp (Meta) bridge`);
-  console.log(`  Listening on http://localhost:${config.port}`);
-  console.log(`  Supabase: ${isSupabaseEnabled() ? 'connected' : 'DEGRADED (in-memory)'}`);
+  console.log(`  Listening on [::]:${config.port} (Railway IPv4/IPv6)`);
+  console.log(
+    `  Supabase: ${
+      isSupabaseEnabled() ? 'configured (health probe required)' : 'UNAVAILABLE'
+    }`
+  );
   console.log(`  Webhook:  POST /webhooks/shopify/orders-create\n`);
 });
 
@@ -2730,153 +2652,12 @@ setInterval(
 );
 
 // ------------------------------------------------------------
-//  Order-confirmation catch-up + failed-send retry queue
-//  Webhooks can be missed; sends can fail (IMAGE header, token).
-//  We (1) poll open orders missing a successful log and (2) keep
-//  an in-memory retry queue with exponential backoff until success
-//  or max retries — so no order stays permanently "not sent".
+//  Order-confirmation catch-up
+//
+//  Scans only recent orders with no prior attempt. Failed or uncertain sends
+//  are terminal and require a new explicit operator/customer request.
 // ------------------------------------------------------------
 let orderConfirmJobRunning = false;
-
-/** @type {Map<string, { orderId: string, attempts: number, nextAt: number, reason: string, orderNumber: string }>} */
-const confirmRetryQueue = new Map();
-
-function enqueueConfirmRetry(orderId, { reason = '', orderNumber = '' } = {}) {
-  const id = String(orderId || '').trim();
-  if (!/^\d+$/.test(id)) return;
-  const prev = confirmRetryQueue.get(id);
-  const attempts = prev ? prev.attempts : 0;
-  if (attempts >= config.orderConfirm.maxRetries) {
-    console.warn(
-      `[confirm-queue] giving up on order ${orderNumber || id} after ${attempts} retries`
-    );
-    return;
-  }
-  const nextAttempts = attempts + (prev ? 0 : 0); // attempts counted on process
-  const delay =
-    config.orderConfirm.retryBaseMs *
-    Math.pow(2, Math.min(prev ? prev.attempts : 0, 5));
-  confirmRetryQueue.set(id, {
-    orderId: id,
-    attempts: prev ? prev.attempts : 0,
-    nextAt: Date.now() + (prev ? delay : 5000),
-    reason: reason || (prev && prev.reason) || 'retry',
-    orderNumber: orderNumber || (prev && prev.orderNumber) || '',
-  });
-  if (!prev) {
-    console.log(
-      `[confirm-queue] enqueued ${orderNumber || id} (${reason || 'retry'})`
-    );
-  }
-  void nextAttempts;
-}
-
-function dequeueConfirmRetry(orderId) {
-  confirmRetryQueue.delete(String(orderId || ''));
-}
-
-async function drainConfirmRetryQueue({ source = 'order-confirm-retry', limit = 20 } = {}) {
-  const now = Date.now();
-  const due = [...confirmRetryQueue.values()]
-    .filter((j) => j.nextAt <= now)
-    .sort((a, b) => a.nextAt - b.nextAt)
-    .slice(0, limit);
-
-  let attempted = 0;
-  let sent = 0;
-  let failed = 0;
-  let skipped = 0;
-  const results = [];
-
-  for (const job of due) {
-    attempted += 1;
-    job.attempts += 1;
-    try {
-      const already = await hasSuccessfulLog(job.orderId, config.meta.templateName);
-      if (already) {
-        skipped += 1;
-        dequeueConfirmRetry(job.orderId);
-        results.push({ order_id: job.orderId, skipped: true, reason: 'already_sent' });
-        continue;
-      }
-      const got = await fetchOrderById(job.orderId);
-      if (!got.ok) {
-        failed += 1;
-        job.nextAt =
-          Date.now() +
-          config.orderConfirm.retryBaseMs *
-            Math.pow(2, Math.min(job.attempts, 5));
-        if (job.attempts >= config.orderConfirm.maxRetries) {
-          confirmRetryQueue.delete(job.orderId);
-        }
-        results.push({
-          order_id: job.orderId,
-          success: false,
-          response: got.message || got.error,
-        });
-        continue;
-      }
-      const st = statusFromTags(got.order.tags);
-      if (
-        st === 'confirmed' ||
-        st === 'cancelled' ||
-        st === 'pending' ||
-        got.order.cancelled_at
-      ) {
-        skipped += 1;
-        dequeueConfirmRetry(job.orderId);
-        results.push({
-          order_id: job.orderId,
-          skipped: true,
-          reason: st || 'cancelled',
-        });
-        continue;
-      }
-      const out = await processOrder(got.order, { source });
-      if (out && out.success) {
-        sent += 1;
-        dequeueConfirmRetry(job.orderId);
-        results.push({
-          order_id: job.orderId,
-          order_number: out.order_number,
-          success: true,
-        });
-      } else if (out && out.skipped) {
-        skipped += 1;
-        dequeueConfirmRetry(job.orderId);
-        results.push({ order_id: job.orderId, skipped: true });
-      } else {
-        failed += 1;
-        job.nextAt =
-          Date.now() +
-          config.orderConfirm.retryBaseMs *
-            Math.pow(2, Math.min(job.attempts, 5));
-        job.reason = (out && out.response) || 'send failed';
-        if (job.attempts >= config.orderConfirm.maxRetries) {
-          console.warn(
-            `[confirm-queue] max retries for ${job.orderNumber || job.orderId}`
-          );
-          confirmRetryQueue.delete(job.orderId);
-        }
-        results.push({
-          order_id: job.orderId,
-          success: false,
-          response: (out && out.response) || 'send failed',
-          attempts: job.attempts,
-        });
-      }
-      await sleep(400);
-    } catch (err) {
-      failed += 1;
-      job.nextAt =
-        Date.now() +
-        config.orderConfirm.retryBaseMs * Math.pow(2, Math.min(job.attempts, 5));
-      results.push({ order_id: job.orderId, success: false, response: err.message });
-    }
-  }
-
-  return { attempted, sent, failed, skipped, queued: confirmRetryQueue.size, results };
-}
 
 async function runOrderConfirmCatchUpJob({
   source = 'order-confirm-cron',
@@ -2886,7 +2667,7 @@ async function runOrderConfirmCatchUpJob({
     Math.max(parseInt(limit, 10) || config.orderConfirm.batchLimit, 1),
     100
   );
-  const lookbackMs = config.orderConfirm.lookbackHours * 60 * 60 * 1000;
+  const lookbackMs = config.orderConfirm.lookbackMinutes * 60 * 1000;
   const cutoff = Date.now() - lookbackMs;
 
   // Open orders first (up to 100), then also scan status=any for
@@ -2913,7 +2694,7 @@ async function runOrderConfirmCatchUpJob({
       sent: 0,
       failed: 0,
       skipped: 0,
-      queued: confirmRetryQueue.size,
+      queued: 0,
     };
   }
 
@@ -2957,10 +2738,11 @@ async function runOrderConfirmCatchUpJob({
   for (const order of candidates) {
     if (attempted >= cap) break;
     try {
-      const already = await hasSuccessfulLog(order.id, templateName);
-      if (already) {
+      // Any previous attempt is terminal for automated delivery. Retrying a
+      // timeout or rejected request later is how stale duplicates were sent.
+      const attemptedBefore = await hasMessageAttempt(order.id, templateName);
+      if (attemptedBefore) {
         skipped += 1;
-        dequeueConfirmRetry(order.id);
         continue;
       }
       attempted += 1;
@@ -2980,49 +2762,35 @@ async function runOrderConfirmCatchUpJob({
         });
       } else {
         failed += 1;
-        enqueueConfirmRetry(order.id, {
-          reason: (out && out.response) || 'send failed',
-          orderNumber: order.name || order.order_number,
-        });
         results.push({
           order_number: order.name || order.order_number,
           success: false,
           response: (out && out.response) || 'send failed',
-          queued: true,
+          queued: false,
         });
       }
       // Gentle pacing for Meta + Shopify rate limits.
       await sleep(450);
     } catch (err) {
       failed += 1;
-      enqueueConfirmRetry(order.id, {
-        reason: err.message,
-        orderNumber: order.name || order.order_number,
-      });
       results.push({
         order_number: order.name || order.order_number,
         success: false,
         response: err.message,
-        queued: true,
+        queued: false,
       });
     }
   }
 
-  // Drain due retries from earlier failures.
-  const drain = await drainConfirmRetryQueue({
-    source: source + '+retry',
-    limit: Math.max(5, Math.floor(cap / 2)),
-  });
-
   return {
     ok: true,
     scanned: candidates.length,
-    attempted: attempted + drain.attempted,
-    sent: sent + drain.sent,
-    failed: failed + drain.failed,
-    skipped: skipped + drain.skipped,
-    queued: confirmRetryQueue.size,
-    results: results.concat(drain.results || []),
+    attempted,
+    sent,
+    failed,
+    skipped,
+    queued: 0,
+    results,
   };
 }
 
@@ -3030,6 +2798,13 @@ async function runScheduledOrderConfirmJob() {
   if (orderConfirmJobRunning) return;
   orderConfirmJobRunning = true;
   try {
+    const persistence = await checkSupabaseHealth();
+    if (!persistence.healthy) {
+      console.warn(
+        `[order-confirm-cron] skipped: persistence ${persistence.configCode}`
+      );
+      return;
+    }
     const r = await runOrderConfirmCatchUpJob({ source: 'order-confirm-cron' });
     if (!r.ok) {
       console.warn(
@@ -3053,8 +2828,8 @@ if (config.orderConfirm.cronEnabled) {
   const interval = config.orderConfirm.cronIntervalMs;
   console.log(
     `  Order confirm cron: enabled every ${Math.round(interval / 1000)}s ` +
-      `(template=${config.meta.templateName}, lookback=${config.orderConfirm.lookbackHours}h, ` +
-      `maxRetries=${config.orderConfirm.maxRetries})`
+      `(template=${config.meta.templateName}, ` +
+      `lookback=${config.orderConfirm.lookbackMinutes}m, autoRetry=false)`
   );
   setInterval(runScheduledOrderConfirmJob, interval);
   // First catch-up shortly after boot (give token keepalive a moment).
@@ -3068,6 +2843,13 @@ async function runScheduledOrderUpdateJob() {
   if (orderUpdateJobRunning) return;
   orderUpdateJobRunning = true;
   try {
+    const persistence = await checkSupabaseHealth();
+    if (!persistence.healthy) {
+      console.warn(
+        `[order-update-cron] skipped: persistence ${persistence.configCode}`
+      );
+      return;
+    }
     const r = await runOrderUpdateJob({ source: 'order-update-cron' });
     if (!r.ok) {
       console.warn(

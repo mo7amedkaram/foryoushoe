@@ -67,12 +67,12 @@ export const config = {
     orderUpdateTemplateName:
       process.env.META_ORDER_UPDATE_TEMPLATE_NAME || 'order_update',
     orderUpdateButtonIndex: process.env.META_ORDER_UPDATE_BUTTON_INDEX || '0',
-    // Optional fallback header image if a product has none.
-    fallbackImage: process.env.META_FALLBACK_IMAGE || '',
   },
 
   orderUpdates: {
-    cronEnabled: process.env.ORDER_UPDATE_CRON_ENABLED !== 'false',
+    // Opt-in only. An absent Railway variable must not replay old fulfilled
+    // orders after a deploy or restart.
+    cronEnabled: bool(process.env.ORDER_UPDATE_CRON_ENABLED),
     cronIntervalMs: Math.max(
       parseInt(process.env.ORDER_UPDATE_CRON_INTERVAL_MS || '60000', 10),
       15000
@@ -83,13 +83,10 @@ export const config = {
     ),
   },
 
-  // Catch-up + failed-order retry queue for confirmation templates.
-  // Scans recent open orders and (re)sends when there is no successful
-  // message_log row. Failed sends are re-queued with backoff so no
-  // order stays permanently "not sent".
+  // Optional catch-up for recent confirmation templates. It sends only when
+  // there is no previous claim/log attempt; delivery is never auto-retried.
   orderConfirm: {
-    cronEnabled: process.env.ORDER_CONFIRM_CRON_ENABLED !== 'false',
-    // Default every 60s so failed/missed orders clear quickly.
+    cronEnabled: bool(process.env.ORDER_CONFIRM_CRON_ENABLED),
     cronIntervalMs: Math.max(
       parseInt(process.env.ORDER_CONFIRM_CRON_INTERVAL_MS || '60000', 10),
       20000
@@ -98,19 +95,11 @@ export const config = {
       Math.max(parseInt(process.env.ORDER_CONFIRM_CRON_BATCH_LIMIT || '50', 10), 1),
       100
     ),
-    // Only consider orders created within this lookback window.
-    lookbackHours: Math.min(
-      Math.max(parseInt(process.env.ORDER_CONFIRM_LOOKBACK_HOURS || '72', 10), 1),
-      168
-    ),
-    // In-memory retry queue for failed processOrder attempts.
-    maxRetries: Math.min(
-      Math.max(parseInt(process.env.ORDER_CONFIRM_MAX_RETRIES || '8', 10), 1),
-      20
-    ),
-    retryBaseMs: Math.max(
-      parseInt(process.env.ORDER_CONFIRM_RETRY_BASE_MS || '30000', 10),
-      5000
+    // Catch up only genuinely recent orders; older attempts require an
+    // explicit operator action.
+    lookbackMinutes: Math.min(
+      Math.max(parseInt(process.env.ORDER_CONFIRM_LOOKBACK_MINUTES || '15', 10), 1),
+      180
     ),
   },
 

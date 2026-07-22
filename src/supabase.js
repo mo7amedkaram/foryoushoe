@@ -2,9 +2,9 @@
 //  src/supabase.js
 //  Supabase client factory + config/log helpers.
 //
-//  Degraded mode: when Supabase env vars are missing the app keeps
-//  config in memory and skips persisting the message log so that the
-//  UI and the full send pipeline still work for testing.
+//  Local development may use in-memory state when Supabase is not configured.
+//  Production send claims fail closed if configured persistence is invalid or
+//  unavailable; cross-instance idempotency must never silently degrade.
 // ============================================================
 import { createClient } from '@supabase/supabase-js';
 import { config } from './config.js';
@@ -12,26 +12,121 @@ import { config } from './config.js';
 const CONFIG_ROW_ID = 1; // single-row config table
 const SHOPIFY_AUTH_ROW_ID = 1; // single-row shopify_auth table
 
+function decodeJwtPayload(token) {
+  try {
+    const payload = String(token || '').split('.')[1];
+    if (!payload) return null;
+    return JSON.parse(Buffer.from(payload, 'base64url').toString('utf8'));
+  } catch {
+    return null;
+  }
+}
+
+export function validateSupabaseConfig({ url, serviceRoleKey } = {}) {
+  if (!url || !serviceRoleKey) return { valid: false, code: 'NOT_CONFIGURED' };
+  let projectRef = '';
+  try {
+    const hostname = new URL(url).hostname.toLowerCase();
+    if (!hostname.endsWith('.supabase.co')) {
+      return { valid: false, code: 'INVALID_PROJECT_URL' };
+    }
+    projectRef = hostname.split('.')[0];
+  } catch {
+    return { valid: false, code: 'INVALID_URL' };
+  }
+  const payload = decodeJwtPayload(serviceRoleKey);
+  if (!payload) return { valid: false, code: 'INVALID_SERVICE_KEY' };
+  if (payload.role !== 'service_role') {
+    return { valid: false, code: 'KEY_IS_NOT_SERVICE_ROLE' };
+  }
+  if (payload.ref && projectRef && payload.ref !== projectRef) {
+    return { valid: false, code: 'PROJECT_REF_MISMATCH' };
+  }
+  return { valid: true, code: 'OK', projectRef };
+}
+
+const supabaseConfig = validateSupabaseConfig({
+  url: config.supabase.url,
+  serviceRoleKey: config.supabase.serviceRoleKey,
+});
 let client = null;
-if (config.supabase.enabled) {
+let lastHealth = {
+  checkedAt: 0,
+  healthy: false,
+  code: supabaseConfig.code,
+  error: null,
+};
+
+if (supabaseConfig.valid) {
   try {
     client = createClient(config.supabase.url, config.supabase.serviceRoleKey, {
       auth: { persistSession: false },
     });
-    console.log('[supabase] connected.');
+    console.log('[supabase] client configured; awaiting health probe.');
   } catch (err) {
-    console.warn('[supabase] failed to create client, falling back to memory:', err.message);
+    console.warn('[supabase] failed to create client:', err.message);
     client = null;
+    lastHealth = {
+      checkedAt: Date.now(),
+      healthy: false,
+      code: 'CLIENT_INIT_FAILED',
+      error: err.message,
+    };
   }
 } else {
   console.warn(
-    '[supabase] SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY not set. ' +
-      'Running in degraded mode: config in memory, message log NOT persisted.'
+    `[supabase] persistence unavailable (${supabaseConfig.code}). ` +
+      'Outbound production sends will fail closed.'
   );
 }
 
 export function isSupabaseEnabled() {
   return Boolean(client);
+}
+
+export function isSupabaseConfigured() {
+  return Boolean(config.supabase.enabled);
+}
+
+export function getSupabaseStatus() {
+  return {
+    configured: isSupabaseConfigured(),
+    configValid: supabaseConfig.valid,
+    configCode: supabaseConfig.code,
+    healthy: Boolean(lastHealth.healthy),
+    checkedAt: lastHealth.checkedAt
+      ? new Date(lastHealth.checkedAt).toISOString()
+      : null,
+    error: lastHealth.error,
+  };
+}
+
+export async function checkSupabaseHealth({ force = false } = {}) {
+  if (!client) return getSupabaseStatus();
+  if (!force && Date.now() - lastHealth.checkedAt < 15000) {
+    return getSupabaseStatus();
+  }
+  try {
+    const { error: configError } = await client
+      .from('app_config')
+      .select('id')
+      .limit(1);
+    if (configError) throw configError;
+    const { error: claimsError } = await client
+      .from('send_claims')
+      .select('claim_key')
+      .limit(1);
+    if (claimsError) throw claimsError;
+    lastHealth = { checkedAt: Date.now(), healthy: true, code: 'OK', error: null };
+  } catch (error) {
+    lastHealth = {
+      checkedAt: Date.now(),
+      healthy: false,
+      code: 'QUERY_FAILED',
+      error: String(error?.message || error).slice(0, 300),
+    };
+  }
+  return getSupabaseStatus();
 }
 
 // ---- In-memory fallback stores ----
@@ -52,9 +147,6 @@ const memory = {
   // Durable-enough for single process: claim_key -> claim row
   claims: new Map(),
 };
-
-// Stale "claimed" rows older than this may be re-acquired (crashed worker).
-const CLAIM_STALE_MS = 10 * 60 * 1000;
 
 // ------------------------------------------------------------
 //  getConfig() -> { settings, mapping, selected_template_id, phone_number_id }
@@ -289,7 +381,7 @@ export async function successfulOrderIdSet(limit = 1000) {
 
 // ------------------------------------------------------------
 //  hasSuccessfulLog(orderId, templateId) -> boolean
-//  Best-effort idempotency check.
+//  Fail-closed idempotency check.
 // ------------------------------------------------------------
 export async function hasSuccessfulLog(orderId, templateId) {
   if (!orderId) return false;
@@ -297,7 +389,7 @@ export async function hasSuccessfulLog(orderId, templateId) {
   const tid = templateId ? String(templateId) : null;
 
   // Always check in-process memory first. insertLog writes here even when
-  // Supabase is down — without this, catch-up/retry re-sends every order.
+  // Supabase is down — without this, automated workers can resend an order.
   const memHit = memory.logs.some(
     (l) =>
       String(l.shopify_order_id || '') === oid &&
@@ -313,7 +405,7 @@ export async function hasSuccessfulLog(orderId, templateId) {
     if (claim && claim.status === 'sent') return true;
   }
 
-  if (!client) return false;
+  if (!client) return isSupabaseConfigured();
   try {
     let q = client
       .from('message_log')
@@ -325,13 +417,10 @@ export async function hasSuccessfulLog(orderId, templateId) {
     if (error) throw error;
     return (count || 0) > 0;
   } catch (err) {
-    console.warn(
-      '[supabase] hasSuccessfulLog failed (using memory only):',
-      err.message
-    );
+    console.warn('[supabase] hasSuccessfulLog failed closed:', err.message);
     // Memory already checked above — do NOT return a false-negative that
     // would cause a duplicate WhatsApp send.
-    return false;
+    return true;
   }
 }
 
@@ -350,8 +439,11 @@ export function inboundClaimKey(messageId) {
   return `inbound:${String(messageId)}`;
 }
 
-export function inquiryClaimKey(orderId, messageId) {
-  return `inquiry:${String(orderId)}:${String(messageId || 'na')}`;
+export function inquiryItemClaimKey(orderId, messageId, itemIdentity) {
+  return (
+    `inquiry-item:${String(orderId)}:${String(messageId || 'na')}:` +
+    String(itemIdentity || 'unknown')
+  );
 }
 
 async function getSendClaim(claimKey) {
@@ -383,7 +475,8 @@ async function getSendClaim(claimKey) {
  * tryAcquireSendClaim({ claimKey, kind, shopifyOrderId, webhookId, templateId })
  * Insert-wins. Returns:
  *   { acquired: true }
- *   { acquired: false, reason: 'already_sent'|'in_progress'|'duplicate', existing }
+ *   { acquired: false, reason: 'already_sent'|'already_failed'|
+ *     'in_progress'|'persistence_unavailable', existing? }
  */
 export async function tryAcquireSendClaim({
   claimKey,
@@ -395,21 +488,15 @@ export async function tryAcquireSendClaim({
   const key = String(claimKey || '').trim();
   if (!key) return { acquired: false, reason: 'missing_key' };
 
-  const now = Date.now();
-  const existing = await getSendClaim(key);
-  if (existing) {
-    if (existing.status === 'sent') {
-      return { acquired: false, reason: 'already_sent', existing };
-    }
-    if (existing.status === 'claimed') {
-      const age =
-        now - (Date.parse(existing.updated_at || existing.created_at || '') || 0);
-      if (age < CLAIM_STALE_MS) {
-        return { acquired: false, reason: 'in_progress', existing };
-      }
-      // Stale claimed → re-acquire below.
-    }
-    // failed or stale claimed → allow re-claim
+  const memoryClaim = memory.claims.get(key);
+  if (memoryClaim) {
+    const reason =
+      memoryClaim.status === 'sent'
+        ? 'already_sent'
+        : memoryClaim.status === 'failed'
+          ? 'already_failed'
+          : 'in_progress';
+    return { acquired: false, reason, existing: memoryClaim };
   }
 
   const row = {
@@ -425,85 +512,46 @@ export async function tryAcquireSendClaim({
     updated_at: new Date().toISOString(),
   };
 
-  // Memory acquire (single-process / degraded mode).
-  const mem = memory.claims.get(key);
-  if (mem && mem.status === 'sent') {
-    return { acquired: false, reason: 'already_sent', existing: mem };
-  }
-  if (mem && mem.status === 'claimed') {
-    const age = now - (Date.parse(mem.updated_at || mem.created_at || '') || 0);
-    if (age < CLAIM_STALE_MS) {
-      return { acquired: false, reason: 'in_progress', existing: mem };
+  if (!client) {
+    if (isSupabaseConfigured()) {
+      return { acquired: false, reason: 'persistence_unavailable' };
     }
+    memory.claims.set(key, row);
+    return { acquired: true, claim: row, localOnly: true };
   }
-  memory.claims.set(key, { ...row });
 
-  if (!client) return { acquired: true, claim: row };
+  const health = await checkSupabaseHealth();
+  if (!health.healthy) {
+    return { acquired: false, reason: 'persistence_unavailable' };
+  }
 
   try {
-    // Prefer insert; on conflict inspect existing row.
     const { error } = await client.from('send_claims').insert(row);
-    if (!error) return { acquired: true, claim: row };
+    if (!error) {
+      memory.claims.set(key, row);
+      return { acquired: true, claim: row };
+    }
 
-    // Unique violation or other conflict — read winner.
-    const { data: winner, error: selErr } = await client
+    const { data: winner, error: selectError } = await client
       .from('send_claims')
       .select('*')
       .eq('claim_key', key)
       .maybeSingle();
-    if (selErr) throw selErr;
+    if (selectError) throw selectError;
     if (winner) {
       memory.claims.set(key, winner);
-      if (winner.status === 'sent') {
-        return { acquired: false, reason: 'already_sent', existing: winner };
-      }
-      if (winner.status === 'claimed') {
-        const age =
-          now - (Date.parse(winner.updated_at || winner.created_at || '') || 0);
-        if (age < CLAIM_STALE_MS) {
-          return { acquired: false, reason: 'in_progress', existing: winner };
-        }
-        // Re-claim stale row.
-        const { error: upErr } = await client
-          .from('send_claims')
-          .update({
-            status: 'claimed',
-            updated_at: new Date().toISOString(),
-            message_id: null,
-            response: null,
-          })
-          .eq('claim_key', key)
-          .eq('status', 'claimed');
-        if (!upErr) {
-          memory.claims.set(key, { ...winner, status: 'claimed' });
-          return { acquired: true, claim: { ...winner, status: 'claimed' } };
-        }
-        return { acquired: false, reason: 'in_progress', existing: winner };
-      }
-      // failed → update to claimed
-      const { error: up2 } = await client
-        .from('send_claims')
-        .update({
-          status: 'claimed',
-          updated_at: new Date().toISOString(),
-          message_id: null,
-          response: null,
-        })
-        .eq('claim_key', key);
-      if (!up2) {
-        memory.claims.set(key, { ...winner, status: 'claimed' });
-        return { acquired: true, claim: { ...winner, status: 'claimed' } };
-      }
-      return { acquired: false, reason: 'duplicate', existing: winner };
+      const reason =
+        winner.status === 'sent'
+          ? 'already_sent'
+          : winner.status === 'failed'
+            ? 'already_failed'
+            : 'in_progress';
+      return { acquired: false, reason, existing: winner };
     }
-    // No winner row — treat insert error as non-fatal acquire via memory.
-    return { acquired: true, claim: row };
-  } catch (err) {
-    if (!/relation .* does not exist|Could not find the table/i.test(err.message || '')) {
-      console.warn('[supabase] tryAcquireSendClaim failed (memory only):', err.message);
-    }
-    // Memory already holds the claim.
-    return { acquired: true, claim: row, degraded: true };
+    throw error;
+  } catch (error) {
+    console.warn('[supabase] send claim failed closed:', error.message);
+    return { acquired: false, reason: 'persistence_unavailable' };
   }
 }
 
@@ -523,41 +571,47 @@ export async function completeSendClaim(
     response: response != null ? String(response).slice(0, 2000) : prev.response || null,
     updated_at,
   };
-  // On failure, drop memory claim so retries can re-acquire quickly.
-  if (success) memory.claims.set(key, next);
-  else memory.claims.delete(key);
+  // A failed/uncertain send is terminal for this request. Re-acquiring it can
+  // duplicate a message that Meta accepted before a timeout or process crash.
+  memory.claims.set(key, next);
 
   if (!client) return;
-  try {
-    if (success) {
-      await client.from('send_claims').upsert(
-        {
-          claim_key: key,
-          kind: next.kind || 'confirm',
-          shopify_order_id: next.shopify_order_id || null,
-          webhook_id: next.webhook_id || null,
-          template_id: next.template_id || null,
-          status: 'sent',
-          message_id: next.message_id,
-          response: next.response,
-          updated_at,
-        },
-        { onConflict: 'claim_key' }
-      );
-    } else {
-      await client
+  const persisted = {
+    claim_key: key,
+    kind: next.kind || 'confirm',
+    shopify_order_id: next.shopify_order_id || null,
+    webhook_id: next.webhook_id || null,
+    template_id: next.template_id || null,
+    status,
+    message_id: next.message_id,
+    response: next.response,
+    updated_at,
+  };
+
+  // Retrying this idempotent database upsert is safe and preserves the
+  // provider message id needed by reply/status callbacks. This is not a
+  // customer-message retry; Meta's /messages endpoint is never called here.
+  let lastError = null;
+  for (let attempt = 1; attempt <= 3; attempt += 1) {
+    try {
+      const { error } = await client
         .from('send_claims')
-        .update({
-          status: 'failed',
-          response: next.response,
-          updated_at,
-        })
-        .eq('claim_key', key);
+        .upsert(persisted, { onConflict: 'claim_key' });
+      if (!error) return;
+      lastError = error;
+    } catch (error) {
+      lastError = error;
     }
-  } catch (err) {
-    if (!/relation .* does not exist|Could not find the table/i.test(err.message || '')) {
-      console.warn('[supabase] completeSendClaim failed:', err.message);
+    if (attempt < 3) {
+      await new Promise((resolve) => setTimeout(resolve, attempt * 75));
     }
+  }
+
+  if (lastError) {
+    console.warn(
+      '[supabase] completeSendClaim failed after 3 persistence attempts:',
+      lastError.message || lastError
+    );
   }
 }
 
@@ -594,47 +648,155 @@ function phoneMatches(stored, candidateVariants) {
 }
 
 // ------------------------------------------------------------
-//  findRecentOrderByPhone(phone) -> shopify_order_id | null
-//  Correlates an inbound WhatsApp button click (from a phone) to
-//  the most recent order we sent that phone.
+//  Inbound message -> exact order correlation
 // ------------------------------------------------------------
-export async function findRecentOrderByPhone(phone) {
-  const variants = phoneDigitVariants(phone);
-  if (!variants.length) return null;
-
-  // 1) In-memory logs (always, including when Supabase is up).
-  const memHit = memory.logs.find(
-    (l) =>
-      l.shopify_order_id &&
-      phoneMatches(l.recipient_phone, variants) &&
-      // Prefer real Shopify numeric ids
-      /^\d+$/.test(String(l.shopify_order_id))
+export async function findSendClaimByMessageId(messageId) {
+  const id = String(messageId || '').trim();
+  if (!id) return null;
+  const outboundKinds = new Set(['confirm', 'inquiry_item', 'order_update']);
+  const memoryMatch = [...memory.claims.values()].find(
+    (claim) =>
+      outboundKinds.has(claim.kind) && String(claim.message_id || '') === id
   );
-  if (memHit) return String(memHit.shopify_order_id);
-
+  if (memoryMatch) return memoryMatch;
   if (!client) return null;
 
   try {
-    // 2) Pull recent logs and match phone flexibly (exact eq is too brittle).
+    const { data, error } = await client
+      .from('send_claims')
+      .select('*')
+      .in('kind', [...outboundKinds])
+      .eq('message_id', id)
+      .limit(2);
+    if (error) throw error;
+    const rows = data || [];
+    return rows.length === 1 ? rows[0] : null;
+  } catch (error) {
+    console.warn('[supabase] provider-message lookup failed:', error.message);
+    return null;
+  }
+}
+
+export async function findOrderByReplyMessageId(messageId) {
+  const id = String(messageId || '').trim();
+  if (!id) return null;
+
+  const memoryMatches = [...memory.claims.values()]
+    .filter(
+      (claim) =>
+        claim.kind === 'confirm' &&
+        claim.status === 'sent' &&
+        String(claim.message_id || '') === id &&
+        /^\d+$/.test(String(claim.shopify_order_id || ''))
+    )
+    .map((claim) => String(claim.shopify_order_id));
+  if (new Set(memoryMatches).size === 1) return memoryMatches[0];
+
+  if (!client) return null;
+  try {
+    const { data, error } = await client
+      .from('send_claims')
+      .select('shopify_order_id')
+      .eq('kind', 'confirm')
+      .eq('status', 'sent')
+      .eq('message_id', id)
+      .limit(2);
+    if (error) throw error;
+    const orderIds = [
+      ...new Set(
+        (data || [])
+          .map((row) => String(row.shopify_order_id || ''))
+          .filter((orderId) => /^\d+$/.test(orderId))
+      ),
+    ];
+    return orderIds.length === 1 ? orderIds[0] : null;
+  } catch (error) {
+    console.warn('[supabase] reply-message lookup failed:', error.message);
+    return null;
+  }
+}
+
+function matchingConfirmationOrderIds(logs, variants) {
+  return [
+    ...new Set(
+      logs
+        .filter(
+          (log) =>
+            log.success === true &&
+            String(log.template_id || '') === String(config.meta.templateName) &&
+            /^\d+$/.test(String(log.shopify_order_id || '')) &&
+            phoneMatches(log.recipient_phone, variants)
+        )
+        .map((log) => String(log.shopify_order_id))
+    ),
+  ];
+}
+
+export async function findUnambiguousOrderByPhone(phone) {
+  const variants = phoneDigitVariants(phone);
+  if (!variants.length) return null;
+
+  const memoryIds = matchingConfirmationOrderIds(memory.logs, variants);
+  if (!client) return memoryIds.length === 1 ? memoryIds[0] : null;
+
+  try {
     const { data, error } = await client
       .from('message_log')
-      .select('shopify_order_id, recipient_phone, created_at, success')
+      .select(
+        'shopify_order_id, recipient_phone, template_id, created_at, success'
+      )
+      .eq('success', true)
+      .eq('template_id', config.meta.templateName)
       .not('shopify_order_id', 'is', null)
       .order('created_at', { ascending: false })
       .limit(200);
     if (error) throw error;
-    for (const row of data || []) {
-      if (!phoneMatches(row.recipient_phone, variants)) continue;
-      const oid = String(row.shopify_order_id || '');
-      if (/^\d+$/.test(oid)) return oid;
-    }
+    const orderIds = [
+      ...new Set([
+        ...memoryIds,
+        ...matchingConfirmationOrderIds(data || [], variants),
+      ]),
+    ];
+    return orderIds.length === 1 ? orderIds[0] : null;
+  } catch (error) {
+    console.warn('[supabase] phone correlation failed:', error.message);
     return null;
-  } catch (err) {
-    console.warn('[supabase] findRecentOrderByPhone failed:', err.message);
-    const hit = memory.logs.find(
-      (l) => l.shopify_order_id && phoneMatches(l.recipient_phone, variants)
-    );
-    return hit ? String(hit.shopify_order_id) : null;
+  }
+}
+
+export async function hasMessageAttempt(orderId, templateId) {
+  const order = String(orderId || '');
+  const template = String(templateId || '');
+  if (!order) return false;
+
+  if (
+    memory.logs.some(
+      (log) =>
+        String(log.shopify_order_id || '') === order &&
+        (!template || String(log.template_id || '') === template)
+    )
+  ) {
+    return true;
+  }
+  if (template && memory.claims.has(confirmClaimKey(order, template))) return true;
+  if (!client) return isSupabaseConfigured();
+
+  try {
+    if (template) {
+      const claim = await getSendClaim(confirmClaimKey(order, template));
+      if (claim) return true;
+    }
+    let query = client
+      .from('message_log')
+      .select('id', { count: 'exact', head: true })
+      .eq('shopify_order_id', order);
+    if (template) query = query.eq('template_id', template);
+    const { count, error } = await query;
+    if (error) throw error;
+    return (count || 0) > 0;
+  } catch (error) {
+    console.warn('[supabase] attempt lookup failed closed:', error.message);
+    return true;
   }
 }
 
@@ -715,6 +877,10 @@ export async function saveShopifyAuth({ shop, access_token, scope, expires_at })
 
 export default {
   isSupabaseEnabled,
+  isSupabaseConfigured,
+  getSupabaseStatus,
+  checkSupabaseHealth,
+  validateSupabaseConfig,
   getConfig,
   saveConfig,
   insertLog,
@@ -725,10 +891,13 @@ export default {
   confirmClaimKey,
   webhookClaimKey,
   inboundClaimKey,
-  inquiryClaimKey,
+  inquiryItemClaimKey,
   tryAcquireSendClaim,
   completeSendClaim,
-  findRecentOrderByPhone,
+  findUnambiguousOrderByPhone,
+  findOrderByReplyMessageId,
+  findSendClaimByMessageId,
+  hasMessageAttempt,
   getShopifyAuth,
   saveShopifyAuth,
 };

@@ -3,8 +3,9 @@
 A single-page Node.js (Express) + Supabase app that receives Shopify
 `orders/create` webhooks, resolves order fields into WhatsApp template
 parameters, and sends confirmation messages through Meta's WhatsApp
-Cloud API. Configuration, variable mappings, and send logs are stored
-in Supabase, with an in-memory fallback when Supabase is not configured.
+Cloud API. Configuration, variable mappings, logs, and durable send claims are
+stored in Supabase. In-memory state is for local development only; production
+webhooks and workers fail closed when persistence is unavailable.
 joud.chat remains available for legacy template discovery.
 
 > ملاحظات بالعربية مختصرة موجودة بعد كل قسم.
@@ -14,7 +15,7 @@ joud.chat remains available for legacy template discovery.
 ## 1. Requirements
 
 - Node.js v22+ (uses the built-in global `fetch` and `crypto`)
-- A Supabase project (optional but recommended)
+- A Supabase project (required in production)
 - A public URL for the Shopify webhook (tunnel or deploy)
 
 ---
@@ -22,26 +23,25 @@ joud.chat remains available for legacy template discovery.
 ## 2. Install
 
 ```powershell
-cd D:\Data\shopify-whatsapp
+cd <project-directory>
 npm install
 ```
 
-Fill in `.env` (already created with the provided real credentials).
-Use `.env.example` as the template. The Supabase keys are intentionally
-blank — the app still boots and the UI still works without them
-(degraded / in-memory mode).
+Copy `.env.example` to `.env` and fill in local credentials. The app can boot
+without Supabase for local UI work, but health checks and production webhook
+delivery require a reachable project with the repository schema applied.
 
 **عربي:** ثبّت الحزم بـ `npm install`، ثم افتح ملف `.env` واملأ مفاتيح
-Supabase (اختياري). البرنامج يعمل حتى بدونها لكن بدون حفظ دائم.
+Supabase. يمكن تشغيل الواجهة محليًا بدونها، لكنها مطلوبة للإرسال في الإنتاج.
 
 ---
 
-## 3. Supabase setup (recommended)
+## 3. Supabase setup (required in production)
 
 1. Create a project at <https://supabase.com>.
 2. Open **SQL Editor → New query**, paste the contents of
    [`supabase/schema.sql`](supabase/schema.sql), and **Run**. This
-   creates `app_config` and `message_log`.
+   creates `app_config`, `message_log`, `send_claims`, and `shopify_auth`.
 3. Go to **Project Settings → API** and copy:
    - **Project URL** → `SUPABASE_URL`
    - **service_role** secret → `SUPABASE_SERVICE_ROLE_KEY`
@@ -147,7 +147,7 @@ credentials. To register a webhook via the Admin API you also need an
    Develop apps**.
 2. Open (or create) your custom app.
 3. **Configuration → Admin API integration**: grant the
-   `write_orders` / `read_orders` scopes (and webhook scopes).
+   `write_orders` and `read_products` scopes (plus webhook scopes).
 4. **API credentials → Install app**, then copy the
    **Admin API access token** (`shpat_...`).
 
@@ -157,7 +157,7 @@ Register the webhook (PowerShell):
 $store = "for-you-shoe-6129.myshopify.com"
 $token = "shpat_xxx_your_admin_api_access_token"
 $publicUrl = "https://YOUR-PUBLIC-URL/webhooks/shopify/orders-create"
-$apiVersion = "2024-10"
+$apiVersion = "2026-07"
 
 $body = @{
   webhook = @{
@@ -177,7 +177,7 @@ Equivalent `curl`:
 
 ```bash
 curl -X POST \
-  "https://for-you-shoe-6129.myshopify.com/admin/api/2024-10/webhooks.json" \
+  "https://for-you-shoe-6129.myshopify.com/admin/api/2026-07/webhooks.json" \
   -H "X-Shopify-Access-Token: shpat_xxx_your_admin_api_access_token" \
   -H "Content-Type: application/json" \
   -d '{"webhook":{"topic":"orders/create","address":"https://YOUR-PUBLIC-URL/webhooks/shopify/orders-create","format":"json"}}'
@@ -194,17 +194,16 @@ verification works out of the box.
 
 ---
 
-## 7. Shopify OAuth setup (REQUIRED to fetch real orders)
+## 7. Shopify Admin API authentication (required)
 
-The Shopify `SHOPIFY_API_KEY` / `SHOPIFY_API_SECRET` in `.env` are the
-**client_id / client_secret of an app you created in the Shopify
-Partner / Developer dashboard** — *not* an Admin custom-app token.
-In 2026 Shopify removed the direct "Admin API access token" tab for
-Partner-created apps, so the app must obtain a token through the
-**OAuth authorization-code grant**. This app implements the **offline
-(non-expiring) token** flow.
+The app supports a static `SHOPIFY_ADMIN_TOKEN`, the headless
+client-credentials grant used by the Settings screen, and Shopify's OAuth
+authorization-code grant. Whichever method is used must grant `write_orders`
+and `read_products`. The OAuth instructions below are needed only when that
+grant is selected; the client-credentials path stores and refreshes its
+expiring token automatically.
 
-### 7.1 What you must do in the Shopify Partner / Developer dashboard
+### 7.1 OAuth dashboard setup (when using OAuth)
 
 1. **Run a public HTTPS tunnel** to your local server (Shopify only
    redirects to HTTPS URLs):
@@ -234,11 +233,11 @@ Partner-created apps, so the app must obtain a token through the
 
 3. **API scopes:** under the app's API access / configuration, request
    these access scopes:
-   - `read_orders`
+   - `write_orders`
    - `read_products`
 
 4. **Protected customer data access** (THE most common blocker):
-   `read_orders` returns **protected customer data**. In the dashboard
+   order access returns **protected customer data**. In the dashboard
    open your app → **API access** → **Protected customer data access**
    → request/enable access. Enable:
    - **Protected customer data** (Orders), and
@@ -272,7 +271,7 @@ Partner-created apps, so the app must obtain a token through the
 
 1. In **نظرة عامة / Overview**, click **تحميل أحدث طلب**. The app calls
    `GET /api/shopify/last-order`, fetches the **most recent real
-   order** (Admin REST `2025-01`, `orders.json?status=any&limit=1`
+   order** (Admin REST `2026-07`, `orders.json?status=any&limit=1`
    newest-first), and shows each of the 12 template variables with its
    resolved value from the real order plus a per-variable mapping
    dropdown.
@@ -295,7 +294,7 @@ Partner-created apps, so the app must obtain a token through the
 2) في لوحة الشريك (Partners) → تطبيقك → URLs: ضع *App URL* =
    `https://<PUBLIC_TUNNEL>` و *Allowed redirection URL* =
    `https://<PUBLIC_TUNNEL>/auth/callback` بنفس النص تمامًا.
-3) الصلاحيات: `read_orders` و `read_products`.
+3) الصلاحيات: `write_orders` و `read_products`.
 4) فعّل **Protected customer data access** للأوردرات وبيانات العميل،
    وإلا سترجع الأوردرات خطأ 403.
 5) افتح `https://<PUBLIC_TUNNEL>/auth` في المتصفح ووافق، سيعود متصلًا.
@@ -331,7 +330,7 @@ HTTP `401` and nothing is sent. (See `src/shopify.js`.)
 | `otherAddress`     | billing address (same format) |
 | `customerCity`     | shipping (fallback billing) `city` |
 | `customerGovernorate` | shipping (fallback billing) `province` |
-| `productImage`     | first product image; Admin API first, then the store's public product catalog, then `META_FALLBACK_IMAGE` |
+| `productImage`     | exact first ordered variant image resolved by `product_id` + `variant_id`; empty when identity cannot be proven |
 | `trackingNumber`   | tracking number(s) from `order.fulfillments[]` |
 | `trackingLink`     | first tracking URL from `order.fulfillments[]` |
 | `trackingUrl`      | alias for `trackingLink` |
@@ -362,7 +361,7 @@ code in *Settings* or via `DEFAULT_COUNTRY_CODE` in `.env`.
 
 | Method | Path | Purpose |
 | ------ | ---- | ------- |
-| GET  | `/api/health` | `{ ok, supabase }` |
+| GET  | `/api/health` | live Supabase/schema and Shopify product-read health, listener, and worker state (`200` healthy; `503` unavailable) |
 | GET  | `/api/meta` | resolver options + defaults |
 | GET  | `/api/config` | current settings + mapping |
 | POST | `/api/config` | save settings / mapping / template |
@@ -377,12 +376,12 @@ code in *Settings* or via `DEFAULT_COUNTRY_CODE` in `.env`.
 | POST | `/api/order-updates/run` | admin/manual trigger for fulfilled-order `order_update` sends |
 | POST | `/webhooks/shopify/orders-updated` | optional near-real-time fulfilled-order update hook |
 | POST | `/webhooks/shopify/orders-fulfilled` | optional near-real-time fulfilled-order update hook |
+| GET/POST | `/webhooks/whatsapp` | Meta verification plus signed status/button callbacks |
 
-The webhook always returns `200` quickly (Shopify requirement); the
-real outcome — success or the joud.chat error — is recorded in the
-message log. External joud.chat calls are capped at ~10s. Idempotency
-is best-effort: a successful send for the same `order id + template`
-is skipped.
+Shopify webhooks return `401` for an invalid HMAC and `503` while durable
+idempotency is unavailable, allowing a safe redelivery before any provider
+call. A unique `send_claims.claim_key` prevents concurrent or delayed replay;
+failed and uncertain provider attempts are terminal and are not auto-retried.
 
 ### Fulfilled-order tracking updates
 
@@ -391,7 +390,7 @@ The app also polls Shopify for recently updated orders whose
 tracking number and a tracking URL in its `fulfillments[]`, it sends
 the Meta template named by `META_ORDER_UPDATE_TEMPLATE_NAME`
 (default: `order_update`). The tracking URL is sent as a dynamic URL
-button parameter, and `message_log` idempotency prevents duplicate
+button parameter, and a durable `send_claims` row prevents duplicate
 `order_update` sends for the same Shopify order.
 
 Manual test body:
@@ -400,7 +399,7 @@ Manual test body:
 { "scan_limit": 25, "send_limit": 1 }
 ```
 
-Railway runs this in the normal web process:
+The worker is opt-in. Enable it only when tracking updates are intentional:
 
 ```env
 META_ORDER_UPDATE_TEMPLATE_NAME=order_update
@@ -426,15 +425,14 @@ https://YOUR-PUBLIC-URL/webhooks/shopify/orders-fulfilled
   `client_id` / `client_secret` (confirmed by the user), so the Admin
   API token is obtained via **OAuth** (§7), not a custom-app token.
   The same secret also verifies the webhook body HMAC.
-- **OAuth offline token flow** is used (no `grant_options[]`), so the
-  stored token does not expire. It lives in `public.shopify_auth`
-  (single row `id=1`, RLS on, no public policies — server uses the
-  service-role key). In degraded mode it is held in memory only.
+- Static Admin, client-credentials, and OAuth tokens are supported. The
+  headless client-credentials token is refreshed proactively and persisted in
+  `public.shopify_auth`; it expires and must never be treated as permanent.
 - `redirect_uri` is derived from the request host and honors
   `X-Forwarded-Host` / `X-Forwarded-Proto` so it matches a
   cloudflared/ngrok tunnel automatically; it must be whitelisted in
   the Partner dashboard exactly.
-- Admin API version pinned to **`2025-01`** (REST) for order fetch.
+- Admin API version pinned to **`2026-07`** (REST) for order fetch.
   Latest order = `orders.json?status=any&limit=1&order=created_at+desc`
   with a client-side `created_at` re-sort as a safeguard.
 - The real-order preview uses the **natural 1:1 mapping**

@@ -51,7 +51,7 @@ create index if not exists message_log_order_template_idx
 --    confirm:<shopify_order_id>:<template>
 --    webhook:<X-Shopify-Webhook-Id>
 --    inbound:<wamid>
---    inquiry:<order_id>:<wamid>
+--    inquiry-item:<order_id>:<wamid>:<line_item_id>
 --  Insert-wins: only the first worker acquires the claim.
 -- ------------------------------------------------------------
 create table if not exists public.send_claims (
@@ -74,6 +74,16 @@ create index if not exists send_claims_order_idx
 
 create index if not exists send_claims_webhook_idx
   on public.send_claims (webhook_id);
+
+-- A button reply's context.id is the provider message_id of the exact
+-- confirmation. This index makes that ID a durable order-correlation key.
+create unique index if not exists send_claims_confirm_message_id_uidx
+  on public.send_claims (message_id)
+  where kind = 'confirm' and status = 'sent' and message_id is not null;
+
+create index if not exists send_claims_message_id_idx
+  on public.send_claims (message_id)
+  where message_id is not null;
 
 alter table public.send_claims enable row level security;
 

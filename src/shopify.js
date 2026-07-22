@@ -288,8 +288,8 @@ export const resolvers = {
     label: 'Product image / link (صورة المنتج)',
     // The Shopify order payload does NOT carry the product image, so
     // processOrder / the preview enrich the order with
-    // `productImageUrl` (resolved via the Admin API). Prefer that;
-    // fall back to any image fields that happen to be present.
+    // `productImageUrl` (resolved by product_id + variant_id). Unidentified
+    // line-item image fields are deliberately not used as a fallback.
     // Protocol-relative CDN URLs ("//cdn...") are upgraded to https.
     fn: (order) => {
       const norm = (u) => {
@@ -303,14 +303,7 @@ export const resolvers = {
         const u = norm(order.productImageUrl);
         if (u) return u;
       }
-      const items = Array.isArray(order.line_items) ? order.line_items : [];
-      const li = items[0] || {};
-      return (
-        norm(li.image && (li.image.src || li.image.url || li.image)) ||
-        norm(li.image_url) ||
-        norm(li.product_image) ||
-        ''
-      );
+      return '';
     },
   },
   trackingNumber: {

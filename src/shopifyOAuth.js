@@ -15,8 +15,8 @@ import { config } from './config.js';
 import { getShopifyAuth, saveShopifyAuth } from './supabase.js';
 
 const TIMEOUT_MS = 10000;
-const ADMIN_API_VERSION = '2025-01';
-const OAUTH_SCOPES = 'read_orders,read_products';
+const ADMIN_API_VERSION = '2026-07';
+const OAUTH_SCOPES = 'write_orders,read_products';
 
 // shop must look exactly like "<store>.myshopify.com"
 const SHOP_RE = /^[a-zA-Z0-9][a-zA-Z0-9-]*\.myshopify\.com$/;
@@ -368,6 +368,40 @@ export async function keepShopifyTokenAlive() {
   return { ok: false, error: 'NOT_CONNECTED' };
 }
 
+let productAccessHealth = {
+  checkedAt: 0,
+  healthy: false,
+  status: 0,
+  error: 'NOT_CHECKED',
+};
+let productScopeRefreshAttempted = false;
+
+export async function checkShopifyProductAccess({ force = false } = {}) {
+  if (!force && Date.now() - productAccessHealth.checkedAt < 60000) {
+    return { ...productAccessHealth };
+  }
+  let result = await adminApiGet('products/count.json');
+  // A newly granted scope is not added to an already-issued token. Refresh a
+  // client-credentials token once on 403, then probe the actual capability
+  // again. Static tokens must be replaced by their operator instead.
+  if (
+    result.status === 403 &&
+    !config.shopify.adminToken &&
+    !productScopeRefreshAttempted
+  ) {
+    productScopeRefreshAttempted = true;
+    await ensureAdminToken({ forceRefresh: true });
+    result = await adminApiGet('products/count.json');
+  }
+  productAccessHealth = {
+    checkedAt: Date.now(),
+    healthy: Boolean(result.ok),
+    status: result.status || 0,
+    error: result.ok ? null : result.error || 'PRODUCT_READ_FAILED',
+  };
+  return { ...productAccessHealth };
+}
+
 // ------------------------------------------------------------
 //  adminApiGet(path) -> { ok, status, data } | { ok:false, error }
 //
@@ -444,13 +478,12 @@ export async function adminApiGet(path, { _retried = false } = {}) {
     return {
       ok: false,
       status: 403,
-      error: 'FORBIDDEN_PROTECTED_DATA',
+      error: 'FORBIDDEN_SCOPE_OR_PROTECTED_DATA',
       message:
-        'Shopify returned 403 for the Orders API. The Orders/customer fields ' +
-        'are PROTECTED customer data. In the Shopify Partner/Developer ' +
-        'dashboard open the app → "API access" → "Protected customer data ' +
-        'access" and request/enable access (Orders + customer PII), then ' +
-        're-connect via /auth.',
+        `Shopify returned 403 for ${cleanPath}. Grant the required Admin API ` +
+        'scope in the app configuration (read_products for exact variant ' +
+        'images; write_orders for order access and status updates), approve ' +
+        'protected customer data when applicable, then obtain a fresh token.',
     };
   }
   if (!res.ok) {
@@ -528,35 +561,97 @@ export function normalizeShopifyImageUrl(input) {
   return s.replace(/[\r\n\t\s]+/g, '');
 }
 
-function pickImageSrcFromProduct(product, variantId = '') {
-  if (!product || typeof product !== 'object') return '';
+function imageSource(image) {
+  if (!image) return '';
+  if (typeof image === 'string') return normalizeShopifyImageUrl(image);
+  return normalizeShopifyImageUrl(image.src || image.url || '');
+}
+
+function variantForId(product, variantId) {
+  if (!variantId || !Array.isArray(product?.variants)) return null;
+  return (
+    product.variants.find(
+      (variant) => String(variant.id) === String(variantId)
+    ) || null
+  );
+}
+
+export function resolveExactVariantImage(product, variantId = '') {
+  if (!product || typeof product !== 'object') return null;
   const images = Array.isArray(product.images) ? product.images : [];
-  if (variantId && Array.isArray(product.variants)) {
-    const v = product.variants.find((x) => String(x.id) === String(variantId));
-    if (v && v.image_id) {
-      const vi = images.find((im) => String(im.id) === String(v.image_id));
-      if (vi && vi.src) return normalizeShopifyImageUrl(vi.src);
+  const variant = variantForId(product, variantId);
+
+  if (variantId && !variant) return null;
+  if (!variantId) {
+    if (Array.isArray(product.variants) && product.variants.length > 1) {
+      return null;
+    }
+    const productImage = product.image || images[0];
+    const url = imageSource(productImage);
+    return url
+      ? { url, imageId: String(productImage?.id || ''), match: 'product' }
+      : null;
+  }
+
+  const byImageId = variant.image_id
+    ? images.find((image) => String(image.id) === String(variant.image_id))
+    : null;
+  const byVariantIds = images.find((image) =>
+    (image.variant_ids || []).some((id) => String(id) === String(variantId))
+  );
+  const exactImage = byImageId || byVariantIds || variant.featured_image;
+  const exactUrl = imageSource(exactImage);
+  if (exactUrl) {
+    return {
+      url: exactUrl,
+      imageId: String(exactImage?.id || variant.image_id || ''),
+      match: byImageId
+        ? 'variant_image_id'
+        : byVariantIds
+        ? 'image_variant_ids'
+        : 'variant_featured_image',
+    };
+  }
+
+  if (product.variants.length === 1) {
+    const soleImage = product.image || images[0];
+    const soleUrl = imageSource(soleImage);
+    if (soleUrl) {
+      return {
+        url: soleUrl,
+        imageId: String(soleImage?.id || ''),
+        match: 'single_variant_product',
+      };
     }
   }
-  if (product.image && product.image.src) {
-    return normalizeShopifyImageUrl(product.image.src);
-  }
-  if (images[0] && images[0].src) {
-    return normalizeShopifyImageUrl(images[0].src);
-  }
-  return '';
+  return null;
+}
+
+function pickImageSrcFromProduct(product, variantId = '') {
+  return resolveExactVariantImage(product, variantId)?.url || '';
 }
 
 function imageFromLineItem(li) {
   if (!li || typeof li !== 'object') return '';
-  const candidates = [
-    li.image && (li.image.src || li.image.url || li.image),
-    li.image_url,
-    li.product_image,
-    li.featured_image && (li.featured_image.src || li.featured_image.url),
-  ];
+  const image = li.image || li.featured_image;
+  const lineVariantId = String(li.variant_id || '');
+  const imageVariantId = String(image?.variant_id || '');
+  const imageVariantIds = Array.isArray(image?.variant_ids)
+    ? image.variant_ids.map(String)
+    : [];
+  const imageHasMatchingIdentity = Boolean(
+    lineVariantId &&
+      (imageVariantId === lineVariantId || imageVariantIds.includes(lineVariantId))
+  );
+  // Scalar image_url/product_image fields have no variant identity. They are
+  // safe only for line items without a variant; otherwise require the image
+  // object itself to declare the matching variant.
+  const candidates = imageHasMatchingIdentity ? [image] : [];
+  if (!lineVariantId && !li.product_id) {
+    candidates.push(image, li.image_url, li.product_image);
+  }
   for (const c of candidates) {
-    const u = normalizeShopifyImageUrl(c);
+    const u = imageSource(c);
     if (u) return u;
   }
   return '';
@@ -1049,126 +1144,136 @@ export async function markOrderPending(orderId) {
   }
 }
 
-// Parse Shopify variant_title like "Beige / 37" or "Grey / 39".
-function parseVariantTitle(variantTitle) {
-  const vt = String(variantTitle == null ? '' : variantTitle).trim();
-  if (!vt) return { color: '', size: '' };
-  const parts = vt
-    .split(/\s*\/\s*/)
-    .map((s) => s.trim())
-    .filter(Boolean);
-  if (parts.length >= 2) {
-    const last = parts[parts.length - 1];
-    // Last segment looks like a shoe size → treat as size.
-    if (/^\d{1,2}([.,]\d+)?$/.test(last) || /^\d{2}$/.test(last)) {
-      return { color: parts.slice(0, -1).join(' / '), size: last };
-    }
-    return { color: parts[0], size: parts.slice(1).join(' / ') };
+// Parse an unlabeled Shopify variant title only when option metadata is not
+// available. A single non-numeric value is not guessed to be a size or color.
+export function parseVariantTitle(variantTitle) {
+  const value = normalizedText(variantTitle);
+  if (!value || /^default title$/i.test(value)) {
+    return { color: '', size: '', options: [] };
   }
-  return { color: '', size: vt };
+  const parts = value.split(/\s*\/\s*/).map(normalizedText).filter(Boolean);
+  if (parts.length === 1) {
+    const isSize = /^\d{1,3}([.,]\d+)?$/.test(parts[0]);
+    return {
+      color: '',
+      size: isSize ? parts[0] : '',
+      options: [{ name: isSize ? 'Size' : 'Variant', value: parts[0], position: 1 }],
+    };
+  }
+  const last = parts.at(-1);
+  const lastIsSize = /^\d{1,3}([.,]\d+)?$/.test(last);
+  return {
+    color: lastIsSize && parts.length === 2 ? parts[0] : '',
+    size: lastIsSize ? last : '',
+    options: parts.map((part, index) => ({
+      name: lastIsSize && index === parts.length - 1 ? 'Size' : 'Variant',
+      value: part,
+      position: index + 1,
+    })),
+  };
+}
+
+function normalizedText(value) {
+  return String(value == null ? '' : value).trim();
+}
+
+function optionKind(name) {
+  const value = normalizedText(name).toLowerCase();
+  if (/colou?r/.test(value) || value.includes('\u0644\u0648\u0646')) return 'color';
+  if (/size/.test(value) || value.includes('\u0645\u0642\u0627\u0633')) return 'size';
+  return '';
+}
+
+function mappedVariantOptions(product, variant) {
+  if (!variant) return [];
+  return (Array.isArray(product?.options) ? product.options : [])
+    .map((option, index) => {
+      const position = Number(option?.position) || index + 1;
+      const value = normalizedText(variant[`option${position}`]);
+      return value
+        ? { name: normalizedText(option?.name) || `Option ${position}`, value, position }
+        : null;
+    })
+    .filter(Boolean)
+    .sort((a, b) => a.position - b.position);
+}
+
+function exactLineItemImage(lineItem) {
+  const url = imageFromLineItem(lineItem);
+  if (!url) return null;
+  const image = lineItem.image || lineItem.featured_image || {};
+  return { url, imageId: String(image.id || ''), match: 'line_item_variant' };
+}
+
+export function mapLineItemToDetailedItem(lineItem, product = null) {
+  const productId = normalizedText(lineItem?.product_id);
+  const variantId = normalizedText(lineItem?.variant_id);
+  const variant = variantForId(product, variantId);
+  const variantTitle = normalizedText(variant?.title || lineItem?.variant_title);
+  let options = mappedVariantOptions(product, variant);
+  let color = '';
+  let size = '';
+
+  for (const option of options) {
+    const kind = optionKind(option.name);
+    if (kind === 'color') color = option.value;
+    if (kind === 'size') size = option.value;
+  }
+  if (!options.length && variantTitle) {
+    const parsed = parseVariantTitle(variantTitle);
+    options = parsed.options;
+    color = parsed.color;
+    size = parsed.size;
+  }
+
+  const image = exactLineItemImage(lineItem) || resolveExactVariantImage(product, variantId);
+  const quantity = Math.max(Number.parseInt(lineItem?.quantity, 10) || 1, 1);
+  return {
+    lineItemId: normalizedText(lineItem?.id),
+    productId,
+    variantId,
+    sku: normalizedText(lineItem?.sku || variant?.sku),
+    quantity,
+    qty: quantity,
+    title: normalizedText(lineItem?.title || lineItem?.name || product?.title) || 'item',
+    variantTitle: /^default title$/i.test(variantTitle) ? '' : variantTitle,
+    options,
+    color,
+    size,
+    imageUrl: image?.url || '',
+    imageId: image?.imageId || '',
+    imageMatch: image?.match || 'missing',
+  };
 }
 
 // ------------------------------------------------------------
-//  getOrderItemsDetailed(order) -> [{ qty, title, size, color,
-//  imageUrl }]  (one entry per line item, with the variant image)
+//  getOrderItemsDetailed(order)
 //
-//  Admin API product fetch → variant image → featured → first image.
-//  Falls back to public catalog when Admin product read fails (common
-//  cause of missing images on the 2nd+ line item under rate limits).
+//  Each output row is joined by product_id + variant_id, never by array
+//  position. The product cache is scoped to one order so consecutive
+//  customers cannot share product state.
 // ------------------------------------------------------------
 export async function getOrderItemsDetailed(order) {
-  const items = Array.isArray(order && order.line_items)
-    ? order.line_items
-    : [];
-  const norm = (s) => String(s == null ? '' : s).trim();
-  const cache = new Map();
-  const getProduct = async (pid) => {
-    if (!pid) return null;
-    if (cache.has(pid)) return cache.get(pid);
-    // Prefer full product payload (no fields= filter — some apps return
-    // empty image arrays when fields are restricted).
-    let p = null;
-    const resFull = await adminApiGet(`products/${pid}.json`);
-    if (resFull.ok && resFull.data && resFull.data.product) {
-      p = resFull.data.product;
-    }
-    if (!p) {
-      const res = await adminApiGet(
-        `products/${pid}.json?fields=id,image,images,options,variants,handle`
-      );
-      p = res && res.ok && res.data ? res.data.product : null;
-    }
-    // Public catalog / handle fallback.
-    if (!p) {
-      p = await fetchProductById(String(pid), '');
-    }
-    cache.set(pid, p || null);
-    return p;
-  };
-  const out = [];
-  // Cap to bound Admin API calls / outbound messages on huge orders.
-  for (const li of items.slice(0, 25)) {
-    const qty = li.quantity || 1;
-    const title = norm(li.title || li.name) || 'item';
-    let size = '';
-    let color = '';
-    let imageUrl = '';
+  const lineItems = Array.isArray(order?.line_items) ? order.line_items : [];
+  const productCache = new Map();
 
-    // Line-item image fields (rare on REST, common on some payloads).
-    imageUrl =
-      normalizeShopifyImageUrl(
-        (li.image && (li.image.src || li.image.url || li.image)) ||
-          li.image_url ||
-          li.product_image ||
-          ''
-      ) || '';
-
-    const p = await getProduct(li.product_id ? String(li.product_id) : '');
-    if (p) {
-      const opts = Array.isArray(p.options) ? p.options : [];
-      const variants = Array.isArray(p.variants) ? p.variants : [];
-      const v = variants.find((x) => String(x.id) === String(li.variant_id));
-      const optVal = (pos) => (v ? v[`option${pos}`] : null);
-      for (const o of opts) {
-        const val = norm(optVal(o.position));
-        if (!val) continue;
-        if (/colou?r|لون/i.test(o.name)) color = val;
-        else if (/size|مقاس/i.test(o.name)) size = val;
-      }
-      const images = Array.isArray(p.images) ? p.images : [];
-      if (!imageUrl && v && v.image_id) {
-        const vi = images.find((im) => String(im.id) === String(v.image_id));
-        if (vi && vi.src) imageUrl = vi.src;
-      }
-      if (!imageUrl && p.image && p.image.src) imageUrl = p.image.src;
-      if (!imageUrl && images[0] && images[0].src) imageUrl = images[0].src;
-      // Sometimes variants list image via featured_image on public JSON.
-      if (!imageUrl && v && v.featured_image && v.featured_image.src) {
-        imageUrl = v.featured_image.src;
-      }
+  async function productForLineItem(lineItem) {
+    const productId = normalizedText(lineItem?.product_id);
+    const handle = normalizedText(lineItem?.handle || lineItem?.product_handle);
+    const key = productId ? `id:${productId}` : handle ? `handle:${handle}` : '';
+    if (!key) return null;
+    if (!productCache.has(key)) {
+      productCache.set(key, await fetchProductById(productId, handle));
     }
-
-    // Parse "Grey / 39" when product options were unavailable.
-    if ((!size || !color) && norm(li.variant_title)) {
-      const parsed = parseVariantTitle(li.variant_title);
-      if (!color && parsed.color) color = parsed.color;
-      if (!size && parsed.size) size = parsed.size;
-      if (!size && !color) size = norm(li.variant_title);
-    }
-
-    imageUrl = normalizeShopifyImageUrl(imageUrl) || String(imageUrl || '').trim();
-    if (imageUrl && imageUrl.startsWith('//')) imageUrl = 'https:' + imageUrl;
-
-    // Last resort: configured brand fallback so inquiry never drops
-    // the image for a line item that failed product resolution.
-    if (!imageUrl && config.meta.fallbackImage) {
-      imageUrl = normalizeShopifyImageUrl(config.meta.fallbackImage) ||
-        String(config.meta.fallbackImage).trim();
-    }
-
-    out.push({ qty, title, size, color, imageUrl });
+    return productCache.get(key);
   }
-  return out;
+
+  const detailed = [];
+  for (const lineItem of lineItems) {
+    const product = await productForLineItem(lineItem);
+    detailed.push(mapLineItemToDetailedItem(lineItem, product));
+  }
+  return detailed;
 }
 
 export default {
@@ -1180,6 +1285,7 @@ export default {
   getAdminToken,
   ensureAdminToken,
   keepShopifyTokenAlive,
+  checkShopifyProductAccess,
   adminApiGet,
   adminApiSend,
   fetchLatestOrder,
@@ -1189,6 +1295,9 @@ export default {
   markOrderPending,
   setOrderStatusTags,
   getOrderItemsDetailed,
+  mapLineItemToDetailedItem,
+  resolveExactVariantImage,
+  parseVariantTitle,
   fetchProductImageUrl,
   enrichOrderFromShopify,
   normalizeShopifyImageUrl,

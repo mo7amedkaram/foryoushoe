@@ -285,16 +285,6 @@ export async function uploadImageToMeta(imageUrl) {
   }
 }
 
-function isImageHeaderError(rawOrError) {
-  const s = String(rawOrError || '');
-  return (
-    /132012/.test(s) ||
-    /expected IMAGE/i.test(s) ||
-    /header:\s*Format mismatch/i.test(s) ||
-    /Parameter format does not match/i.test(s)
-  );
-}
-
 // ------------------------------------------------------------
 //  listTemplatesMeta() -> { ok, templates:[parsedMetaTemplate] }
 // ------------------------------------------------------------
@@ -428,7 +418,7 @@ function buildTemplatePayload({
     return {
       error:
         'Template requires an IMAGE header but no usable image URL was provided. ' +
-        'Set META_FALLBACK_IMAGE or ensure product images resolve from Shopify.',
+        'Ensure the exact product variant image resolves from Shopify.',
     };
   }
 
@@ -526,7 +516,6 @@ export async function sendTemplateMessage({
   languageCode = 'en',
   orderedValues = [],
   headerImageUrl = '',
-  fallbackImageUrl = '',
   buttonUrlText = '',
   buttonUrlIndex = '0',
   // When true (default for order_confirm_iamge), always require IMAGE.
@@ -580,19 +569,14 @@ export async function sendTemplateMessage({
   }
 
   const primary = toMetaSafeImageUrl(headerImageUrl);
-  const fallback = toMetaSafeImageUrl(
-    fallbackImageUrl || config.meta.fallbackImage || ''
-  );
-  // Prefer product image; fall back to META_FALLBACK_IMAGE so IMAGE
-  // templates never go out without a header component.
-  let imageToUse = primary || fallback;
+  const imageToUse = primary;
 
   if (requireImageHeader && !imageToUse) {
     return {
       success: false,
       httpStatus: 0,
       raw:
-        'Template requires IMAGE header but no product image or META_FALLBACK_IMAGE is available.',
+        'Template requires an IMAGE header but no exact product image is available.',
       messageId: null,
       headerImageUsed: '',
     };
@@ -607,13 +591,6 @@ export async function sendTemplateMessage({
     if (up.ok && up.mediaId) {
       mediaId = up.mediaId;
       mediaSource = up.sourceUrl || imageToUse;
-    } else if (fallback && fallback !== imageToUse) {
-      const up2 = await uploadImageToMeta(fallback);
-      if (up2.ok && up2.mediaId) {
-        mediaId = up2.mediaId;
-        mediaSource = up2.sourceUrl || fallback;
-        imageToUse = fallback;
-      }
     }
   }
 
@@ -638,42 +615,9 @@ export async function sendTemplateMessage({
     };
   }
 
-  let result = await postTemplatePayload(built.payload);
+  const result = await postTemplatePayload(built.payload);
   result.headerImageUsed = mediaSource || built.imageLink || '';
   result.headerMediaId = mediaId || null;
-
-  // If Meta rejects the product image (404/unsupported format/size),
-  // retry once with the configured fallback image when different.
-  if (
-    !result.success &&
-    requireImageHeader &&
-    fallback &&
-    fallback !== imageToUse &&
-    isImageHeaderError(result.raw)
-  ) {
-    let fbMediaId = '';
-    const upFb = await uploadImageToMeta(fallback);
-    if (upFb.ok) fbMediaId = upFb.mediaId || '';
-    const retry = buildTemplatePayload({
-      to,
-      templateName,
-      langCode,
-      texts,
-      headerImageUrl: fallback,
-      headerImageMediaId: fbMediaId,
-      requireImageHeader: true,
-      buttonUrlText,
-      buttonUrlIndex,
-    });
-    if (!retry.error) {
-      const second = await postTemplatePayload(retry.payload);
-      second.headerImageUsed = (upFb && upFb.sourceUrl) || retry.imageLink || '';
-      second.headerMediaId = fbMediaId || null;
-      second.retriedWithFallback = true;
-      second.primaryImageError = result.raw;
-      result = second;
-    }
-  }
 
   return result;
 }
@@ -720,11 +664,8 @@ async function sendRawMessage(payload) {
 }
 
 export async function sendImageMessage({ to, imageUrl, caption = '' }) {
-  // Inquiry multi-item sends often fail when Meta cannot fetch a raw
-  // .webp CDN link for the 2nd/3rd free-form image. Strategy:
-  //   1) Prefer media upload of PNG/JPEG (Meta always accepts id)
-  //   2) Try public link (raw + format=png)
-  //   3) Return failure so caller can try another URL / text
+  // Prefer a media upload, but issue exactly one /messages request. Retrying
+  // a send after a timeout can duplicate a message Meta already accepted.
   const rawLink = normalizeImageUrl(imageUrl);
   const pngLink = toMetaSafeImageUrl(imageUrl) || rawLink;
   if (!to || (!rawLink && !pngLink)) {
@@ -739,46 +680,33 @@ export async function sendImageMessage({ to, imageUrl, caption = '' }) {
   const cap = caption ? String(caption).slice(0, 1024) : '';
   const attempts = [];
 
-  // 1) Media upload — try PNG-converted URL first, then raw.
-  for (const src of [pngLink, rawLink].filter(Boolean)) {
+  // Media uploads do not deliver a customer message, so trying both source
+  // encodings is safe. Once one upload works, send its media id exactly once.
+  for (const src of [...new Set([pngLink, rawLink].filter(Boolean))]) {
     const up = await uploadImageToMeta(src);
     attempts.push(`upload:${src.slice(0, 60)}=>${up.ok ? up.mediaId : up.error}`);
     if (up.ok && up.mediaId) {
       const image = { id: up.mediaId };
       if (cap) image.caption = cap;
       const r = await sendRawMessage({ to: String(to), type: 'image', image });
-      if (r.success) {
-        return {
-          ...r,
-          imageSource: up.sourceUrl || src,
-          mediaId: up.mediaId,
-          attempts,
-        };
-      }
-      attempts.push(`send-id:${r.raw}`);
+      return {
+        ...r,
+        imageSource: up.sourceUrl || src,
+        mediaId: up.mediaId,
+        attempts,
+      };
     }
   }
 
-  // 2) Public link fallback (original path).
-  for (const src of [pngLink, rawLink].filter(Boolean)) {
-    const image = { link: src };
-    if (cap) image.caption = cap;
-    const r = await sendRawMessage({ to: String(to), type: 'image', image });
-    attempts.push(`link:${src.slice(0, 60)}=>${r.success ? r.messageId : r.raw}`);
-    if (r.success) {
-      return { ...r, imageSource: src, mediaId: null, attempts };
-    }
-  }
-
-  return {
-    success: false,
-    httpStatus: 0,
-    raw: `All image send attempts failed :: ${attempts.join(' | ')}`.slice(0, 1500),
-    messageId: null,
-    imageSource: pngLink || rawLink,
-    mediaId: null,
-    attempts,
-  };
+  // If upload was impossible, make one link-based delivery attempt.
+  const src = pngLink || rawLink;
+  const image = { link: src };
+  if (cap) image.caption = cap;
+  const result = await sendRawMessage({ to: String(to), type: 'image', image });
+  attempts.push(
+    `link:${src.slice(0, 60)}=>${result.success ? result.messageId : result.raw}`
+  );
+  return { ...result, imageSource: src, mediaId: null, attempts };
 }
 
 export async function sendTextMessage({ to, text }) {

@@ -6,7 +6,9 @@
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "boot-test": "node --check server.js"
+    "boot-test": "node --check server.js",
+    "test": "node --test",
+    "test:inquiry-e2e": "node scripts/e2e-duplicate-and-inquiry.mjs"
   },
   "engines": {
     "node": "22.x"

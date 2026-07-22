@@ -52,6 +52,10 @@ Copy each value from your local `.env` into Railway. Do **not** commit `.env`.
 - `SHOPIFY_API_SECRET`
 - `SHOPIFY_ADMIN_TOKEN` (optional; leave empty to use client-credentials)
 
+The installed app/token must grant `write_orders` and `read_products`.
+Without `read_products`, exact variant images cannot be guaranteed and product
+detail delivery fails closed instead of substituting another image.
+
 **Provider / Meta WhatsApp Cloud API**
 - `MESSAGE_PROVIDER` = `meta`
 - `META_ACCESS_TOKEN` — use a **System User** permanent token (or long-lived).
@@ -61,18 +65,18 @@ Copy each value from your local `.env` into Railway. Do **not** commit `.env`.
 - `META_API_VERSION` = `v22.0`
 - `META_TEMPLATE_NAME` = `order_confirm_iamge`
 - `META_TEMPLATE_LANG` = `en` (auto-corrected from the live template)
-- `META_FALLBACK_IMAGE` — **required for reliability**. Public HTTPS JPEG/PNG
-  (store logo is ideal). Used when product image resolution fails so Meta
-  never gets error 132012 (`expected IMAGE, received UNKNOWN`).
 - `META_WEBHOOK_VERIFY_TOKEN` (any string; used in the Meta dashboard)
 - `META_APP_SECRET` — ⚠️ must be the App Secret of the Meta app that is
   **subscribed to the WABA** (App ID `2029610401309541`), NOT a different
   app. The inbound webhook signature is verified with this; a wrong app's
   secret makes every real Meta webhook get rejected.
 
-**Auto-send / token reliability (defaults are fine)**
-- `ORDER_CONFIRM_CRON_ENABLED` = `true` — catch-up for missed webhooks
+**Auto-send / token reliability**
+- `ORDER_CONFIRM_CRON_ENABLED` = `false` — safest default; enable the
+  recent-order scan only after confirming durable claim history is complete
 - `ORDER_CONFIRM_CRON_INTERVAL_MS` = `120000`
+- `ORDER_CONFIRM_LOOKBACK_MINUTES` = `15`
+- `ORDER_UPDATE_CRON_ENABLED` = `false` unless tracking updates are intentional
 - `SHOPIFY_TOKEN_KEEPALIVE_MS` = `1800000` — auto-refresh Shopify
   client-credentials (~24h tokens) so product images keep resolving.
   You should **not** need to click “Generate token” manually anymore.
@@ -88,10 +92,18 @@ Copy each value from your local `.env` into Railway. Do **not** commit `.env`.
 - `SUPABASE_SERVICE_ROLE_KEY`
 - `SUPABASE_ANON_KEY`
 
+`SUPABASE_SERVICE_ROLE_KEY` must belong to the same project reference as
+`SUPABASE_URL`. Apply [supabase/schema.sql](supabase/schema.sql) before deploy;
+the `send_claims` table is required for durable idempotency and reply-to-order
+correlation. The health endpoint returns HTTP `503` if this dependency is
+misconfigured, paused, unreachable, or missing its schema, or if Shopify's
+exact product/variant read probe fails.
+
 **joud.chat (only if `MESSAGE_PROVIDER=joud`)**
 - `JOUD_API_TOKEN`, `JOUD_BASE_URL`, `JOUD_PHONE_NUMBER_ID`
 
-`PORT` is injected by Railway automatically — do **not** set it.
+`PORT` is injected by Railway automatically — do **not** set it. The server
+binds `[::]:$PORT`, which accepts Railway private-network IPv6 and public IPv4.
 
 ---
 
@@ -100,6 +112,8 @@ Copy each value from your local `.env` into Railway. Do **not** commit `.env`.
 Railway gives a public HTTPS domain, e.g. `https://foryoushoe.up.railway.app`.
 
 1. **Health check:** open `https://<domain>/api/health` → `{"ok":true,...}`.
+   A `503` response identifies the failed Supabase or Shopify readiness probe;
+   Railway must not route the new deployment until both are healthy.
 
 2. **Meta WhatsApp webhook** — Meta App (`2029610401309541`) →
    **WhatsApp → Configuration → Webhook**:
@@ -124,4 +138,7 @@ Railway gives a public HTTPS domain, e.g. `https://foryoushoe.up.railway.app`.
   with the product image header + size/color in the items line.
 - Tap **«تأكيد الأوردر»** → the order gets tagged `WhatsApp Confirmed` in
   Shopify + a confirmation reply.
-- Tap **«أحتاج الي استفسار»** → images + details of all products are sent.
+- Tap **«أحتاج الي استفسار»** → the reply context resolves the exact
+  confirmation/order, then every line item is sent with its matching variant
+  image and description. If any image cannot be proven, no substitute logo or
+  product image is sent.
