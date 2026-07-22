@@ -2261,92 +2261,46 @@ app.post(
 );
 
 // ------------------------------------------------------------
-//  Inbound WhatsApp helpers (button label + order lookup)
+//  processInboundWhatsAppMessage(msg)
+//
+//  Restored from the original working bridge (commit a5d5bad) with
+//  only reliability fixes that preserve the exact customer-facing
+//  behavior for «أحتاج الي استفسار»:
+//    1) find order by phone (message_log + Shopify fallback)
+//    2) fetch that Shopify order
+//    3) getOrderItemsDetailed → every line item size/color/image
+//    4) text intro + one image message per item (caption = details)
 // ------------------------------------------------------------
 
-// Normalize Arabic so أ/إ/آ/ا and ى/ي match the template button text.
-function normalizeArabicLabel(s) {
-  return String(s || '')
-    .replace(/[\u064B-\u065F\u0670]/g, '') // tashkeel
-    .replace(/[أإآا]/g, 'ا')
-    .replace(/ى/g, 'ي')
-    .replace(/ة/g, 'ه')
-    .replace(/[^\p{L}\p{N}\s]/gu, ' ')
-    .replace(/\s+/g, ' ')
-    .trim()
-    .toLowerCase();
-}
-
-// Pull every possible label field Meta may send for a quick-reply tap.
 function extractInboundLabel(msg) {
   if (!msg || typeof msg !== 'object') return '';
-  const parts = [];
+  // Original path: button quick-reply OR interactive button_reply.
+  if (msg.type === 'button' && msg.button) {
+    return String(msg.button.text || msg.button.payload || '').trim();
+  }
+  if (
+    msg.type === 'interactive' &&
+    msg.interactive &&
+    msg.interactive.button_reply
+  ) {
+    const br = msg.interactive.button_reply;
+    return String(br.title || br.id || '').trim();
+  }
+  // Alternate payload shapes Meta sometimes sends.
   if (msg.button) {
-    parts.push(msg.button.text, msg.button.payload);
+    return String(msg.button.text || msg.button.payload || '').trim();
   }
-  if (msg.interactive) {
-    const br = msg.interactive.button_reply || msg.interactive.list_reply;
-    if (br) parts.push(br.title, br.id, br.description);
+  if (msg.interactive && msg.interactive.button_reply) {
+    const br = msg.interactive.button_reply;
+    return String(br.title || br.id || '').trim();
   }
-  if (msg.text) parts.push(msg.text.body);
-  if (msg.button_reply) {
-    parts.push(msg.button_reply.title, msg.button_reply.id);
+  if (msg.type === 'text' && msg.text && msg.text.body) {
+    return String(msg.text.body).trim();
   }
-  // Some payloads nest under context / referral — rare.
-  if (msg.context && msg.context.referred_product) {
-    /* ignore */
-  }
-  const joined = parts
-    .filter((p) => p != null && String(p).trim() !== '')
-    .map((p) => String(p).trim());
-  // Prefer the longest non-empty human-readable string (Arabic button text).
-  joined.sort((a, b) => b.length - a.length);
-  return joined[0] || '';
+  return '';
 }
 
-/**
- * Classify inbound button/text into confirm | inquiry | cancel | null.
- * Inquiry is checked FIRST so phrases like "استفسار" never fall through.
- * Matches template buttons exactly:
- *   - "أحتاج الي استفسار"
- *   - "تأكيد الأوردر"
- *   - "الغاء الاوردر"
- */
-function classifyInboundIntent(label) {
-  const n = normalizeArabicLabel(label);
-  if (!n) return null;
-
-  // Inquiry FIRST — template button text is exactly "أحتاج الي استفسار"
-  // (and body copy mentions استفسار / تعديل).
-  if (
-    n.includes('استفسار') ||
-    n.includes('تعديل') ||
-    n.includes('inquiry') ||
-    n.includes('احتاج الي') ||
-    n === 'احتاج الي استفسار' ||
-    n.includes('احتاج')
-  ) {
-    return 'inquiry';
-  }
-
-  // Confirm — template: "تأكيد الأوردر"
-  if (
-    n.includes('تاكيد') ||
-    n.includes('confirm') ||
-    (n.includes('نعم') && n.includes('اوردر'))
-  ) {
-    return 'confirm';
-  }
-
-  // Cancel — template: "الغاء الاوردر"
-  if (n.includes('الغاء') || n.includes('cancel') || n.includes('الغي')) {
-    return 'cancel';
-  }
-
-  return null;
-}
-
-// Match a Shopify order phone field against inbound WhatsApp "from".
+// Match Shopify order phone fields against inbound WhatsApp "from".
 function orderPhoneMatches(order, fromDigits) {
   const variants = phoneDigitVariants(fromDigits);
   if (!variants.length) return false;
@@ -2366,12 +2320,12 @@ function orderPhoneMatches(order, fromDigits) {
   return false;
 }
 
-// message_log first, then recent Shopify open/any orders by phone.
+// Original: findRecentOrderByPhone only. Keep that first; add Shopify
+// fallback so multi-instance / missing logs still resolve the order.
 async function resolveOrderIdForInboundPhone(from) {
   const fromLog = await findRecentOrderByPhone(from);
   if (fromLog && /^\d+$/.test(String(fromLog))) return String(fromLog);
 
-  // Shopify fallback — critical when Supabase logs are missing / multi-instance.
   try {
     const fields =
       'id,name,order_number,phone,customer,shipping_address,billing_address,created_at,cancelled_at,line_items,tags';
@@ -2388,151 +2342,16 @@ async function resolveOrderIdForInboundPhone(from) {
   } catch (err) {
     console.warn('[whatsapp-inbound] Shopify phone lookup failed:', err.message);
   }
-  return null;
+  return fromLog ? String(fromLog) : null;
 }
 
-// Send every line item: image + caption (details). Never silent.
-async function sendOrderInquiryDetails(from, order, { orderId, waMsgId }) {
-  const items = await getOrderItemsDetailed(order);
-  if (!items.length) {
-    const r = await metaSendText({
-      to: from,
-      text: 'لا توجد أصناف في هذا الطلب.',
-    });
-    await insertLog({
-      shopify_order_id: orderId,
-      order_number: order.name || order.order_number,
-      recipient_phone: from,
-      template_id: null,
-      variables: { action: 'inquiry', items: 0 },
-      success: Boolean(r && r.success),
-      response: `[inbound] inquiry empty items :: ${r && r.raw}`,
-    });
-    return { sent: 0, imagesSent: 0, items: 0 };
-  }
-
-  const MAX_SEND = 15;
-  const toSend = items.slice(0, MAX_SEND);
-
-  const intro = await metaSendText({
-    to: from,
-    text:
-      `تفاصيل منتجات طلبك (${items.length} صنف) 👇\n` +
-      `رقم الطلب: ${order.name || order.order_number || orderId}`,
-  });
-  await insertLog({
-    shopify_order_id: orderId,
-    order_number: order.name || order.order_number,
-    recipient_phone: from,
-    template_id: null,
-    variables: { action: 'inquiry_intro', items: items.length },
-    success: Boolean(intro && intro.success),
-    response: `[inbound] inquiry intro :: HTTP ${intro.httpStatus || 0} msg ${
-      intro.messageId || '-'
-    } :: ${String(intro.raw || '').slice(0, 400)}`,
-  });
-
-  let sent = 0;
-  let imagesSent = 0;
-  for (let i = 0; i < toSend.length; i++) {
-    const it = toSend[i];
-    const parts = [`${it.qty}x ${it.title}`];
-    if (it.size) parts.push(`المقاس : ${it.size}`);
-    if (it.color) parts.push(`اللون : ${it.color}`);
-    const caption = `(${i + 1}/${items.length}) ${parts.join(' - ')}`;
-    const img =
-      toMetaSafeImageUrl(it.imageUrl) ||
-      normalizeImageUrl(it.imageUrl) ||
-      normalizeShopifyImageUrl(it.imageUrl) ||
-      '';
-
-    let r;
-    if (img) {
-      r = await metaSendImage({ to: from, imageUrl: img, caption });
-      // If image send fails, still deliver details as text.
-      if (!r || !r.success) {
-        const t = await metaSendText({
-          to: from,
-          text: `${caption}\n(تعذّر إرسال الصورة — ${String(
-            (r && r.raw) || 'error'
-          ).slice(0, 120)})`,
-        });
-        r = t;
-      } else {
-        imagesSent += 1;
-      }
-    } else {
-      r = await metaSendText({
-        to: from,
-        text: `${caption}\n(لا تتوفر صورة لهذا المنتج)`,
-      });
-    }
-    if (r && r.success) sent += 1;
-
-    await insertLog({
-      shopify_order_id: orderId,
-      order_number: order.name || order.order_number,
-      recipient_phone: from,
-      template_id: null,
-      variables: {
-        action: 'inquiry_item',
-        index: i + 1,
-        title: it.title,
-        size: it.size,
-        color: it.color,
-        imageUrl: img || null,
-        mediaId: (r && r.mediaId) || null,
-        waMsgId: waMsgId || null,
-      },
-      success: Boolean(r && r.success),
-      response: `[inbound] inquiry item ${i + 1}/${items.length} :: HTTP ${
-        (r && r.httpStatus) || 0
-      } :: msg ${(r && r.messageId) || '-'} :: ${String((r && r.raw) || '').slice(0, 500)}`,
-    });
-    await sleep(400);
-  }
-
-  if (items.length > MAX_SEND) {
-    await metaSendText({
-      to: from,
-      text: `وباقي المنتجات (${items.length - MAX_SEND}) — لو محتاج صورها تواصل معنا 🙏`,
-    });
-  }
-
-  await insertLog({
-    shopify_order_id: orderId,
-    order_number: order.name || order.order_number,
-    recipient_phone: from,
-    template_id: null,
-    variables: {
-      action: 'inquiry',
-      items: items.length,
-      sent,
-      imagesSent,
-    },
-    success: sent > 0,
-    response: `[inbound] inquiry done sent=${sent}/${items.length} images=${imagesSent}`,
-  });
-
-  return { sent, imagesSent, items: items.length };
-}
-
-// ------------------------------------------------------------
-//  processInboundWhatsAppMessage(msg)
-//
-//  Handles a customer tapping a template quick-reply button. The
-//  tap is itself an inbound message, which opens a 24h session, so
-//  we can send free-form image/text replies here.
-//   - "أحتاج الي استفسار"  -> send images + details of ALL products
-//   - "تأكيد الأوردر"      -> confirm the order in Shopify (tag it)
-//   - "الغاء الاوردر"      -> cancel tag
-// ------------------------------------------------------------
 async function processInboundWhatsAppMessage(msg) {
   if (!msg || typeof msg !== 'object') return;
   const from = String(msg.from || '').replace(/\D/g, '');
   if (!from) return;
 
-  // Meta may redeliver the same inbound message — claim wamid once.
+  // Dedup Meta redeliveries of the exact same wamid only (do NOT block
+  // a new tap of the same button — original never blocked re-taps).
   const waMsgId = msg.id ? String(msg.id) : '';
   if (waMsgId) {
     const inClaim = await tryAcquireSendClaim({
@@ -2548,41 +2367,24 @@ async function processInboundWhatsAppMessage(msg) {
   }
 
   const label = extractInboundLabel(msg);
-  const intent = classifyInboundIntent(label);
-
-  console.log(
-    `[whatsapp-inbound] from=${from} type=${msg.type || '?'} label="${label}" ` +
-      `intent=${intent || 'none'} wamid=${waMsgId || '-'} rawKeys=${Object.keys(msg).join(',')}`
-  );
-
-  if (!intent) {
-    // Unknown button/text — do not leave the customer with silence if
-    // they clearly pressed something. Log for debugging.
-    await insertLog({
-      shopify_order_id: null,
-      order_number: null,
-      recipient_phone: from,
-      template_id: null,
-      variables: { action: 'unhandled_inbound', label, type: msg.type || null },
-      success: false,
-      response: `[inbound] unhandled label="${label}" type=${msg.type || '?'}`,
-    });
+  if (!label) {
     if (waMsgId) {
       await completeSendClaim(inboundClaimKey(waMsgId), {
         success: true,
-        response: `unhandled:${label}`,
+        response: 'ignored empty label',
       });
     }
-    return;
+    return; // plain text/other inbound — ignore (original behavior)
   }
 
   const orderId = await resolveOrderIdForInboundPhone(from);
   console.log(
-    `[whatsapp-inbound] resolved orderId=${orderId || 'null'} for ${from}`
+    `[whatsapp-inbound] from ${from} tapped "${label}" (order ${orderId || '?'}) wamid=${waMsgId || '-'}`
   );
 
-  // ---- Confirm order ----
-  if (intent === 'confirm') {
+  // ---- Confirm order (original regex) ----
+  // Prefer inquiry when label also contains استفسار/تعديل.
+  if (/تأكيد|تاكيد|confirm/i.test(label) && !/استفسار|inquiry|تعديل/i.test(label)) {
     if (!orderId) {
       await metaSendText({
         to: from,
@@ -2598,7 +2400,7 @@ async function processInboundWhatsAppMessage(msg) {
     }
     const r = await confirmShopifyOrder(orderId);
     const ok = r && r.ok;
-    const txt = await metaSendText({
+    await metaSendText({
       to: from,
       text: ok
         ? 'تم تأكيد طلبك بنجاح ✅ جارٍ التجهيز والشحن 📦'
@@ -2612,8 +2414,12 @@ async function processInboundWhatsAppMessage(msg) {
       variables: { action: 'confirm', button: label },
       success: Boolean(ok),
       response: `[inbound] confirm -> ${
-        ok ? (r.alreadyConfirmed ? 'already confirmed' : 'tagged confirmed') : (r && r.message) || 'failed'
-      } :: reply HTTP ${(txt && txt.httpStatus) || 0} msg ${(txt && txt.messageId) || '-'}`,
+        ok
+          ? r.alreadyConfirmed
+            ? 'already confirmed'
+            : 'tagged confirmed'
+          : (r && r.message) || 'failed'
+      }`,
     });
     if (waMsgId) {
       await completeSendClaim(inboundClaimKey(waMsgId), {
@@ -2624,14 +2430,14 @@ async function processInboundWhatsAppMessage(msg) {
     return;
   }
 
-  // ---- Inquiry: exact match for template "أحتاج الي استفسار" ----
-  if (intent === 'inquiry') {
+  // ---- Need inquiry -> send all products' images + details ----
+  // Original regex from a5d5bad: /استفسار|inquiry|تعديل/i
+  // Extended slightly so «أحتاج الي استفسار» always matches.
+  if (/استفسار|inquiry|تعديل|أحتاج|احتاج/i.test(label)) {
     if (!orderId) {
       await metaSendText({
         to: from,
-        text:
-          'لم نتمكن من ربط رقمك بطلب حديث.\n' +
-          'لو لسه واصلالك رسالة التأكيد، اضغطي «أحتاج الي استفسار» من نفس الرسالة، أو ابعتيلنا رقم الطلب 🙏',
+        text: 'لم نتمكن من ربط رقمك بطلب حديث. تواصل معنا من فضلك 🙏',
       });
       if (waMsgId) {
         await completeSendClaim(inboundClaimKey(waMsgId), {
@@ -2642,101 +2448,144 @@ async function processInboundWhatsAppMessage(msg) {
       return;
     }
 
-    // Dedup only per WhatsApp message id (allow re-tap later with new wamid).
-    const inqKey = inquiryClaimKey(orderId, waMsgId || `ts:${Date.now()}`);
-    const inqClaim = await tryAcquireSendClaim({
-      claimKey: inqKey,
-      kind: 'inquiry',
-      shopifyOrderId: orderId,
-    });
-    if (!inqClaim.acquired) {
-      console.log(
-        `[whatsapp-inbound] inquiry claim skip order=${orderId} (${inqClaim.reason})`
-      );
-      // Still acknowledge so the customer is not left with silence.
+    const got = await fetchOrderById(orderId);
+    if (!got.ok) {
       await metaSendText({
         to: from,
-        text: 'تم استلام طلب الاستفسار وجارٍ إرسال التفاصيل… لو ما وصلتكيش الصور خلال لحظات، ابعتي «استفسار» تاني 🙏',
+        text: 'تعذّر جلب تفاصيل الطلب حاليًا، حاول لاحقًا 🙏',
       });
       if (waMsgId) {
         await completeSendClaim(inboundClaimKey(waMsgId), {
-          success: true,
-          response: `inquiry skipped ${inqClaim.reason}`,
+          success: false,
+          response: got.message || 'fetch failed',
         });
       }
       return;
     }
 
-    try {
-      const got = await fetchOrderById(orderId);
-      if (!got.ok) {
-        await metaSendText({
-          to: from,
-          text: 'تعذّر جلب تفاصيل الطلب حاليًا، حاول لاحقًا 🙏',
-        });
-        await completeSendClaim(inqKey, {
-          success: false,
-          response: got.message || got.error || 'fetch failed',
-        });
-        if (waMsgId) {
-          await completeSendClaim(inboundClaimKey(waMsgId), {
-            success: true,
-            response: 'inquiry fetch failed',
-          });
-        }
-        return;
-      }
-
-      const out = await sendOrderInquiryDetails(from, got.order, {
-        orderId,
-        waMsgId,
-      });
-      await completeSendClaim(inqKey, {
-        success: out.sent > 0,
-        response: `sent=${out.sent}/${out.items} images=${out.imagesSent}`,
-      });
+    // Exact original pipeline:
+    // getOrderItemsDetailed → intro text → image-per-item with caption
+    const items = await getOrderItemsDetailed(got.order);
+    if (!items.length) {
+      await metaSendText({ to: from, text: 'لا توجد أصناف في هذا الطلب.' });
       if (waMsgId) {
         await completeSendClaim(inboundClaimKey(waMsgId), {
           success: true,
-          response: `inquiry done sent=${out.sent}`,
+          response: 'inquiry no items',
         });
       }
-    } catch (err) {
-      console.error('[whatsapp-inbound] inquiry error:', err.message);
+      return;
+    }
+
+    const MAX_SEND = 10; // original cap
+    const toSend = items.slice(0, MAX_SEND);
+    const intro = await metaSendText({
+      to: from,
+      text: `تفاصيل منتجات طلبك (${items.length} صنف) 👇`,
+    });
+    console.log(
+      `[whatsapp-inbound] inquiry intro ok=${Boolean(intro && intro.success)} ` +
+        `items=${items.length} order=${got.order.name || orderId}`
+    );
+
+    let sent = 0;
+    let imagesSent = 0;
+    for (let i = 0; i < toSend.length; i++) {
+      const it = toSend[i];
+      const parts = [`${it.qty}x ${it.title}`];
+      if (it.size) parts.push(`المقاس : ${it.size}`);
+      if (it.color) parts.push(`اللون : ${it.color}`);
+      const caption = `(${i + 1}/${items.length}) ${parts.join(' - ')}`;
+      let r;
+      const imageUrl = String(it.imageUrl || '').trim();
+      if (imageUrl && /^https?:\/\//i.test(imageUrl)) {
+        // Original: metaSendImage({ to, imageUrl, caption }) — public link.
+        r = await metaSendImage({ to: from, imageUrl, caption });
+        if (r && r.success) {
+          imagesSent += 1;
+        } else {
+          console.warn(
+            `[whatsapp-inbound] image fail item ${i + 1}: ${String(
+              (r && r.raw) || ''
+            ).slice(0, 200)}`
+          );
+          // Graceful: still deliver details as text.
+          r = await metaSendText({ to: from, text: caption });
+        }
+      } else {
+        r = await metaSendText({ to: from, text: caption });
+      }
+      if (r && r.success) sent += 1;
+      console.log(
+        `[whatsapp-inbound] item ${i + 1}/${items.length} success=${Boolean(
+          r && r.success
+        )} msg=${(r && r.messageId) || '-'} image=${Boolean(imageUrl)}`
+      );
+      await insertLog({
+        shopify_order_id: orderId,
+        order_number: got.order.name || got.order.order_number,
+        recipient_phone: from,
+        template_id: null,
+        variables: {
+          action: 'inquiry_item',
+          index: i + 1,
+          title: it.title,
+          size: it.size,
+          color: it.color,
+          imageUrl: imageUrl || null,
+        },
+        success: Boolean(r && r.success),
+        response: `[inbound] inquiry item ${i + 1}/${items.length} :: HTTP ${
+          (r && r.httpStatus) || 0
+        } :: msg ${(r && r.messageId) || '-'} :: ${String((r && r.raw) || '').slice(0, 400)}`,
+      });
+      await sleep(250);
+    }
+
+    if (items.length > MAX_SEND) {
       await metaSendText({
         to: from,
-        text: 'حصلت مشكلة أثناء إرسال تفاصيل الطلب، فريقنا هيتواصل معك 🙏',
+        text: `وباقي المنتجات (${items.length - MAX_SEND}) — لو محتاج صورها تواصل معنا 🙏`,
       });
-      await completeSendClaim(inqKey, {
-        success: false,
-        response: err.message,
+    }
+
+    await insertLog({
+      shopify_order_id: orderId,
+      order_number: got.order.name || got.order.order_number,
+      recipient_phone: from,
+      template_id: null,
+      variables: {
+        action: 'inquiry',
+        items: items.length,
+        sent,
+        imagesSent,
+        button: label,
+      },
+      success: sent > 0,
+      response: `[inbound] inquiry -> sent ${sent}/${items.length} product messages (${imagesSent} with images)`,
+    });
+    if (waMsgId) {
+      await completeSendClaim(inboundClaimKey(waMsgId), {
+        success: sent > 0,
+        response: `inquiry sent=${sent} images=${imagesSent}`,
       });
-      if (waMsgId) {
-        await completeSendClaim(inboundClaimKey(waMsgId), {
-          success: false,
-          response: err.message,
-        });
-      }
     }
     return;
   }
 
-  // ---- Cancel order ----
-  if (intent === 'cancel') {
+  // ---- Cancel ----
+  if (/الغاء|إلغاء|cancel/i.test(label)) {
     if (!orderId) {
       await metaSendText({
         to: from,
         text: 'لم نتمكن من ربط رقمك بطلب حديث. تواصل معنا من فضلك 🙏',
       });
-      await insertLog({
-        shopify_order_id: null,
-        order_number: null,
-        recipient_phone: from,
-        template_id: null,
-        variables: { action: 'cancel', button: label },
-        success: false,
-        response: '[inbound] cancel -> no recent order linked to phone',
-      });
+      if (waMsgId) {
+        await completeSendClaim(inboundClaimKey(waMsgId), {
+          success: true,
+          response: 'cancel no order',
+        });
+      }
       return;
     }
     const r = await cancelShopifyOrder(orderId);
@@ -2762,8 +2611,23 @@ async function processInboundWhatsAppMessage(msg) {
           : (r && r.message) || 'failed'
       }`,
     });
+    if (waMsgId) {
+      await completeSendClaim(inboundClaimKey(waMsgId), {
+        success: true,
+        response: ok ? 'cancelled' : 'cancel failed',
+      });
+    }
+    return;
+  }
+
+  if (waMsgId) {
+    await completeSendClaim(inboundClaimKey(waMsgId), {
+      success: true,
+      response: `unhandled label=${label}`,
+    });
   }
 }
+
 
 // Admin: force a full catch-up + drain of failed/unsent confirmations.
 // Must be registered BEFORE the SPA fallback.
