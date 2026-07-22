@@ -184,8 +184,18 @@ export function normalizePhone(input, countryCode) {
 export const resolvers = {
   storeName: {
     label: 'Store name',
-    fn: (order, settings) =>
-      (settings && settings.store_name) || config.defaults.storeName || '',
+    fn: (order, settings) => {
+      const fromSettings =
+        settings && settings.store_name != null
+          ? String(settings.store_name).trim()
+          : '';
+      // Ignore accidental saves of the raw Shopify subdomain slug.
+      const looksLikeShopifySlug =
+        /^[a-z0-9]+(-[a-z0-9]+)+$/i.test(fromSettings) &&
+        !/\s/.test(fromSettings);
+      if (fromSettings && !looksLikeShopifySlug) return fromSettings;
+      return config.defaults.storeName || fromSettings || '';
+    },
   },
   customerName: {
     label: 'Customer name',

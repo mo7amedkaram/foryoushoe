@@ -47,6 +47,7 @@ Copy each value from your local `.env` into Railway. Do **not** commit `.env`.
 
 **Shopify**
 - `SHOP_DOMAIN`
+- `STORE_NAME` = `For You Shoe` (display name in WhatsApp templates; not the myshopify slug)
 - `SHOPIFY_API_KEY`
 - `SHOPIFY_API_SECRET`
 - `SHOPIFY_ADMIN_TOKEN` (optional; leave empty to use client-credentials)

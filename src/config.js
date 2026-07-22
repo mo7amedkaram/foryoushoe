@@ -10,14 +10,17 @@ function bool(v) {
   return String(v).toLowerCase() === 'true';
 }
 
-// Derive a friendly store name from the *.myshopify.com domain.
+// Derive a fallback store name from the *.myshopify.com domain.
 // e.g. "for-you-shoe-6129.myshopify.com" -> "for-you-shoe-6129"
+// Prefer STORE_NAME env (e.g. "For You Shoe") so WhatsApp templates
+// never show the raw Shopify subdomain.
 function deriveStoreName(domain) {
   if (!domain) return 'My Store';
   return String(domain).replace(/\.myshopify\.com$/i, '').trim() || 'My Store';
 }
 
 const SHOP_DOMAIN = process.env.SHOP_DOMAIN || '';
+const STORE_NAME = (process.env.STORE_NAME || '').trim() || 'For You Shoe';
 
 export const config = {
   port: parseInt(process.env.PORT || '3000', 10),
@@ -132,7 +135,9 @@ export const config = {
 
   // Default values for the editable settings (overridable via the UI).
   defaults: {
-    storeName: deriveStoreName(SHOP_DOMAIN),
+    // Brand display name used in WhatsApp templates ({{storeName}}).
+    // Set STORE_NAME in Railway / .env — do not use the myshopify slug.
+    storeName: STORE_NAME || deriveStoreName(SHOP_DOMAIN),
     defaultCountryCode: (process.env.DEFAULT_COUNTRY_CODE || '20').replace(/\D/g, '') || '20',
     // Where to read the recipient phone from. This store's orders carry
     // the WhatsApp number in the SHIPPING address, so 'shipping' is the
