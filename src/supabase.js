@@ -561,41 +561,80 @@ export async function completeSendClaim(
   }
 }
 
+// Phone digit variants so "2010…", "010…", "+20 10…" all match.
+export function phoneDigitVariants(phone) {
+  const d = String(phone || '').replace(/\D/g, '');
+  if (!d) return [];
+  const out = new Set([d]);
+  if (d.startsWith('20') && d.length >= 12) {
+    out.add(d.slice(2));
+    out.add('0' + d.slice(2));
+  }
+  if (d.startsWith('0') && d.length >= 10) {
+    out.add('20' + d.slice(1));
+    out.add(d.slice(1));
+  }
+  if (!d.startsWith('20') && !d.startsWith('0') && d.length >= 9) {
+    out.add('20' + d);
+    out.add('0' + d);
+  }
+  return [...out];
+}
+
+function phoneMatches(stored, candidateVariants) {
+  const s = String(stored || '').replace(/\D/g, '');
+  if (!s) return false;
+  if (candidateVariants.includes(s)) return true;
+  // Suffix match (last 9–10 digits) covers formatting differences.
+  return candidateVariants.some(
+    (v) =>
+      (v.length >= 9 && s.endsWith(v.slice(-9))) ||
+      (s.length >= 9 && v.endsWith(s.slice(-9)))
+  );
+}
+
 // ------------------------------------------------------------
 //  findRecentOrderByPhone(phone) -> shopify_order_id | null
 //  Correlates an inbound WhatsApp button click (from a phone) to
 //  the most recent order we sent that phone.
 // ------------------------------------------------------------
 export async function findRecentOrderByPhone(phone) {
-  const p = String(phone || '').replace(/\D/g, '');
-  if (!p) return null;
+  const variants = phoneDigitVariants(phone);
+  if (!variants.length) return null;
 
-  if (!client) {
-    const hit = memory.logs.find(
-      (l) =>
-        String(l.recipient_phone || '').replace(/\D/g, '') === p &&
-        l.shopify_order_id
-    );
-    return hit ? hit.shopify_order_id : null;
-  }
+  // 1) In-memory logs (always, including when Supabase is up).
+  const memHit = memory.logs.find(
+    (l) =>
+      l.shopify_order_id &&
+      phoneMatches(l.recipient_phone, variants) &&
+      // Prefer real Shopify numeric ids
+      /^\d+$/.test(String(l.shopify_order_id))
+  );
+  if (memHit) return String(memHit.shopify_order_id);
+
+  if (!client) return null;
+
   try {
+    // 2) Pull recent logs and match phone flexibly (exact eq is too brittle).
     const { data, error } = await client
       .from('message_log')
-      .select('shopify_order_id, recipient_phone, created_at')
-      .eq('recipient_phone', p)
+      .select('shopify_order_id, recipient_phone, created_at, success')
       .not('shopify_order_id', 'is', null)
       .order('created_at', { ascending: false })
-      .limit(1);
+      .limit(200);
     if (error) throw error;
-    return data && data[0] ? data[0].shopify_order_id : null;
+    for (const row of data || []) {
+      if (!phoneMatches(row.recipient_phone, variants)) continue;
+      const oid = String(row.shopify_order_id || '');
+      if (/^\d+$/.test(oid)) return oid;
+    }
+    return null;
   } catch (err) {
     console.warn('[supabase] findRecentOrderByPhone failed:', err.message);
     const hit = memory.logs.find(
-      (l) =>
-        String(l.recipient_phone || '').replace(/\D/g, '') === p &&
-        l.shopify_order_id
+      (l) => l.shopify_order_id && phoneMatches(l.recipient_phone, variants)
     );
-    return hit ? hit.shopify_order_id : null;
+    return hit ? String(hit.shopify_order_id) : null;
   }
 }
 
