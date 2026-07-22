@@ -80,24 +80,34 @@ export const config = {
     ),
   },
 
-  // Catch-up for NEW order confirmations when the Shopify webhook is
-  // missed, delayed, or fails. Scans recent open orders and sends the
-  // confirmation template for any that do not yet have a successful
-  // message_log row. Idempotent via hasSuccessfulLog.
+  // Catch-up + failed-order retry queue for confirmation templates.
+  // Scans recent open orders and (re)sends when there is no successful
+  // message_log row. Failed sends are re-queued with backoff so no
+  // order stays permanently "not sent".
   orderConfirm: {
     cronEnabled: process.env.ORDER_CONFIRM_CRON_ENABLED !== 'false',
+    // Default every 60s so failed/missed orders clear quickly.
     cronIntervalMs: Math.max(
-      parseInt(process.env.ORDER_CONFIRM_CRON_INTERVAL_MS || '120000', 10),
-      30000
+      parseInt(process.env.ORDER_CONFIRM_CRON_INTERVAL_MS || '60000', 10),
+      20000
     ),
     batchLimit: Math.min(
-      Math.max(parseInt(process.env.ORDER_CONFIRM_CRON_BATCH_LIMIT || '25', 10), 1),
+      Math.max(parseInt(process.env.ORDER_CONFIRM_CRON_BATCH_LIMIT || '50', 10), 1),
       100
     ),
     // Only consider orders created within this lookback window.
     lookbackHours: Math.min(
-      Math.max(parseInt(process.env.ORDER_CONFIRM_LOOKBACK_HOURS || '48', 10), 1),
+      Math.max(parseInt(process.env.ORDER_CONFIRM_LOOKBACK_HOURS || '72', 10), 1),
       168
+    ),
+    // In-memory retry queue for failed processOrder attempts.
+    maxRetries: Math.min(
+      Math.max(parseInt(process.env.ORDER_CONFIRM_MAX_RETRIES || '8', 10), 1),
+      20
+    ),
+    retryBaseMs: Math.max(
+      parseInt(process.env.ORDER_CONFIRM_RETRY_BASE_MS || '30000', 10),
+      5000
     ),
   },
 

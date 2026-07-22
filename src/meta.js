@@ -189,7 +189,7 @@ export function normalizeImageUrl(input) {
 // WhatsApp template IMAGE headers are most reliable with JPEG/PNG.
 // Many product assets are stored as .webp on Shopify CDN; Meta has
 // returned 132012 ("expected IMAGE, received UNKNOWN") for some of
-// those. Force Shopify's image service to emit JPEG when possible.
+// those. Force Shopify's image service to emit PNG when possible.
 export function toMetaSafeImageUrl(input) {
   let s = normalizeImageUrl(input);
   if (!s) return '';
@@ -197,20 +197,92 @@ export function toMetaSafeImageUrl(input) {
     /cdn\.shopify\.com\//i.test(s) ||
     /\/cdn\/shop\//i.test(s) ||
     /\.myshopify\.com\//i.test(s);
-  const looksWebp = /\.webp(\?|#|$)/i.test(s) || /format=webp/i.test(s);
-  if (isShopifyCdn && looksWebp) {
+  // Prefer PNG for Shopify-hosted images (incl. webp sources). Meta
+  // template IMAGE headers accept PNG reliably; Shopify CDN re-encodes
+  // via ?format=png.
+  if (isShopifyCdn) {
     try {
       const u = new URL(s);
       u.searchParams.delete('format');
-      u.searchParams.set('format', 'jpg');
-      // Prefer a moderate size so Meta can fetch quickly.
+      u.searchParams.set('format', 'png');
       if (!u.searchParams.has('width')) u.searchParams.set('width', '1200');
       s = u.toString();
     } catch {
-      s = s.includes('?') ? `${s}&format=jpg` : `${s}?format=jpg`;
+      s = s.includes('?') ? `${s}&format=png` : `${s}?format=png`;
     }
   }
   return s;
+}
+
+// Download a public image and upload it to Meta's media endpoint so the
+// template header can use a media id (avoids Meta failing to fetch
+// some CDN / webp links). Returns { ok, mediaId } or { ok:false }.
+export async function uploadImageToMeta(imageUrl) {
+  const link = toMetaSafeImageUrl(imageUrl) || normalizeImageUrl(imageUrl);
+  if (!link || !isMetaConfigured()) {
+    return { ok: false, error: 'Missing image URL or Meta config.' };
+  }
+  let bin;
+  let contentType = 'image/png';
+  try {
+    const imgRes = await fetchWithTimeout(link, { method: 'GET' }, 20000);
+    if (!imgRes.ok) {
+      return { ok: false, error: `Image fetch HTTP ${imgRes.status}` };
+    }
+    const ct = String(imgRes.headers.get('content-type') || '').toLowerCase();
+    if (ct.includes('png')) contentType = 'image/png';
+    else if (ct.includes('jpeg') || ct.includes('jpg')) contentType = 'image/jpeg';
+    else if (ct.includes('webp')) {
+      return { ok: false, error: 'Image is still webp after conversion attempt.' };
+    } else if (ct.startsWith('image/')) contentType = ct.split(';')[0];
+    bin = Buffer.from(await imgRes.arrayBuffer());
+    if (!bin.length || bin.length > 5 * 1024 * 1024) {
+      return { ok: false, error: `Image size invalid (${bin.length} bytes).` };
+    }
+  } catch (err) {
+    return { ok: false, error: `Image fetch failed: ${err.message}` };
+  }
+
+  const ext = contentType.includes('png')
+    ? 'png'
+    : contentType.includes('jpeg') || contentType.includes('jpg')
+      ? 'jpg'
+      : 'bin';
+  const form = new FormData();
+  form.append('messaging_product', 'whatsapp');
+  form.append('type', contentType);
+  form.append('file', new Blob([bin], { type: contentType }), `header.${ext}`);
+
+  try {
+    const res = await fetchWithTimeout(
+      `${graphBase()}/${config.meta.phoneNumberId}/media`,
+      {
+        method: 'POST',
+        headers: authHeader(),
+        body: form,
+      },
+      30000
+    );
+    const text = await res.text().catch(() => '');
+    const json = safeJsonParse(text, null);
+    if (!res.ok || !json || !json.id) {
+      return {
+        ok: false,
+        error:
+          (json && json.error && json.error.message) ||
+          `Media upload HTTP ${res.status}: ${String(text).slice(0, 200)}`,
+      };
+    }
+    return {
+      ok: true,
+      mediaId: String(json.id),
+      contentType,
+      bytes: bin.length,
+      sourceUrl: link,
+    };
+  } catch (err) {
+    return { ok: false, error: `Media upload failed: ${err.message}` };
+  }
 }
 
 function isImageHeaderError(rawOrError) {
@@ -326,6 +398,7 @@ function buildTemplatePayload({
   langCode,
   texts,
   headerImageUrl,
+  headerImageMediaId = '',
   requireImageHeader,
   buttonUrlText,
   buttonUrlIndex,
@@ -333,11 +406,18 @@ function buildTemplatePayload({
   const parameters = texts.map((t) => ({ type: 'text', text: t }));
   const components = [];
   const imageLink = toMetaSafeImageUrl(headerImageUrl);
+  const mediaId = headerImageMediaId ? String(headerImageMediaId) : '';
 
   // Templates with an IMAGE header (order_confirm_iamge) MUST receive
-  // a header component of type image. Omitting it produces Meta
-  // error 132012: "expected IMAGE, received UNKNOWN".
-  if (imageLink) {
+  // a header component of type image. Prefer media id (uploaded PNG)
+  // over a CDN link — more reliable for former-webp product photos.
+  // Omitting the header produces Meta error 132012.
+  if (mediaId) {
+    components.push({
+      type: 'header',
+      parameters: [{ type: 'image', image: { id: mediaId } }],
+    });
+  } else if (imageLink) {
     components.push({
       type: 'header',
       parameters: [{ type: 'image', image: { link: imageLink } }],
@@ -377,6 +457,7 @@ function buildTemplatePayload({
       },
     },
     imageLink,
+    mediaId,
   };
 }
 
@@ -517,12 +598,32 @@ export async function sendTemplateMessage({
     };
   }
 
+  // Prefer uploaded PNG media id for IMAGE headers (webp→png via
+  // Shopify CDN + re-upload to Meta). Fall back to link if upload fails.
+  let mediaId = '';
+  let mediaSource = '';
+  if (requireImageHeader && imageToUse) {
+    const up = await uploadImageToMeta(imageToUse);
+    if (up.ok && up.mediaId) {
+      mediaId = up.mediaId;
+      mediaSource = up.sourceUrl || imageToUse;
+    } else if (fallback && fallback !== imageToUse) {
+      const up2 = await uploadImageToMeta(fallback);
+      if (up2.ok && up2.mediaId) {
+        mediaId = up2.mediaId;
+        mediaSource = up2.sourceUrl || fallback;
+        imageToUse = fallback;
+      }
+    }
+  }
+
   const built = buildTemplatePayload({
     to,
     templateName,
     langCode,
     texts,
     headerImageUrl: imageToUse,
+    headerImageMediaId: mediaId,
     requireImageHeader,
     buttonUrlText,
     buttonUrlIndex,
@@ -538,7 +639,8 @@ export async function sendTemplateMessage({
   }
 
   let result = await postTemplatePayload(built.payload);
-  result.headerImageUsed = built.imageLink || '';
+  result.headerImageUsed = mediaSource || built.imageLink || '';
+  result.headerMediaId = mediaId || null;
 
   // If Meta rejects the product image (404/unsupported format/size),
   // retry once with the configured fallback image when different.
@@ -549,19 +651,24 @@ export async function sendTemplateMessage({
     fallback !== imageToUse &&
     isImageHeaderError(result.raw)
   ) {
+    let fbMediaId = '';
+    const upFb = await uploadImageToMeta(fallback);
+    if (upFb.ok) fbMediaId = upFb.mediaId || '';
     const retry = buildTemplatePayload({
       to,
       templateName,
       langCode,
       texts,
       headerImageUrl: fallback,
+      headerImageMediaId: fbMediaId,
       requireImageHeader: true,
       buttonUrlText,
       buttonUrlIndex,
     });
     if (!retry.error) {
       const second = await postTemplatePayload(retry.payload);
-      second.headerImageUsed = retry.imageLink || '';
+      second.headerImageUsed = (upFb && upFb.sourceUrl) || retry.imageLink || '';
+      second.headerMediaId = fbMediaId || null;
       second.retriedWithFallback = true;
       second.primaryImageError = result.raw;
       result = second;
@@ -642,5 +749,6 @@ export default {
   parseMetaTemplate,
   normalizeImageUrl,
   toMetaSafeImageUrl,
+  uploadImageToMeta,
   sendTemplateMessage,
 };
