@@ -18,6 +18,12 @@ import {
   listLogsPaged,
   successfulOrderIdSet,
   hasSuccessfulLog,
+  confirmClaimKey,
+  webhookClaimKey,
+  inboundClaimKey,
+  inquiryClaimKey,
+  tryAcquireSendClaim,
+  completeSendClaim,
   findRecentOrderByPhone,
   getShopifyAuth,
   saveShopifyAuth,
@@ -33,6 +39,7 @@ import {
   getTemplateMeta,
   normalizeImageUrl,
   toMetaSafeImageUrl,
+  uploadImageToMeta,
 } from './src/meta.js';
 import {
   verifyWebhookHmac,
@@ -1276,6 +1283,13 @@ async function processOrder(
     return { ...rec, skipped: true };
   }
 
+  // Claim key for durable insert-wins idempotency (order + template).
+  const claimKey =
+    orderIdStr && templateId
+      ? confirmClaimKey(orderIdStr, templateId)
+      : '';
+  let claimAcquired = false;
+
   // ---- Strong idempotency (prevents double WhatsApp messages) ----
   // Manual/test sends may set skipIdempotency=true intentionally.
   if (!skipIdempotency) {
@@ -1316,7 +1330,7 @@ async function processOrder(
       };
     }
 
-    // 3) Successful message_log (in-memory + Supabase).
+    // 3) Successful message_log / permanent claim (in-memory + Supabase).
     const already = await hasSuccessfulLog(order.id, templateId);
     if (already) {
       try {
@@ -1333,6 +1347,33 @@ async function processOrder(
         response:
           'Skipped: already sent successfully for this order+template.',
       };
+    }
+
+    // 4) Insert-wins claim BEFORE any Meta call — blocks multi-instance
+    //    Railway races and webhook+cron double delivery.
+    if (claimKey) {
+      const acq = await tryAcquireSendClaim({
+        claimKey,
+        kind: 'confirm',
+        shopifyOrderId: orderIdStr,
+        templateId,
+      });
+      if (!acq.acquired) {
+        try {
+          dequeueConfirmRetry(order.id);
+        } catch {
+          /* ignore */
+        }
+        return {
+          shopify_order_id: order.id,
+          order_number: order.name || order.order_number,
+          template_id: templateId,
+          success: true,
+          skipped: true,
+          response: `Skipped: send claim not acquired (${acq.reason || 'duplicate'}).`,
+        };
+      }
+      claimAcquired = true;
     }
 
     if (orderIdStr) inFlightConfirmSends.add(orderIdStr);
@@ -1372,6 +1413,12 @@ async function processOrder(
       response: 'No recipient phone number could be resolved from the order.',
     };
     await insertLog(rec);
+    if (claimAcquired && claimKey) {
+      await completeSendClaim(claimKey, {
+        success: false,
+        response: rec.response,
+      });
+    }
     return rec;
   }
 
@@ -1431,6 +1478,7 @@ async function processOrder(
     sendResult = {
       success: m.success,
       httpStatus: m.httpStatus,
+      messageId: m.messageId || null,
       raw: m.messageId ? `msg ${m.messageId} :: ${m.raw}` : m.raw,
       headerImageUsed: m.headerImageUsed || headerImageUrl || fallbackImageUrl,
       retriedWithFallback: Boolean(m.retriedWithFallback),
@@ -1440,7 +1488,12 @@ async function processOrder(
         `${sendResult.raw} :: retried_with_fallback after: ${m.primaryImageError || ''}`;
     }
   } catch (err) {
-    sendResult = { success: false, raw: `send error: ${err.message}`, httpStatus: 0 };
+    sendResult = {
+      success: false,
+      raw: `send error: ${err.message}`,
+      httpStatus: 0,
+      messageId: null,
+    };
   }
 
   const rec = {
@@ -1458,6 +1511,20 @@ async function processOrder(
     response: `[${source}] HTTP ${sendResult.httpStatus} :: ${sendResult.raw}`,
   };
   await insertLog(rec);
+
+  // Finalize durable claim: success = permanent "sent"; failure releases
+  // so a later retry/catch-up can re-acquire.
+  if (claimAcquired && claimKey) {
+    try {
+      await completeSendClaim(claimKey, {
+        success: Boolean(sendResult.success),
+        messageId: sendResult.messageId || null,
+        response: rec.response,
+      });
+    } catch {
+      /* ignore */
+    }
+  }
 
   // After a SUCCESSFUL WhatsApp send, best-effort tag the Shopify
   // order as "Pending Confirmation" (only if it has no final state).
@@ -1495,6 +1562,18 @@ async function processOrder(
     }
   }
   return rec;
+  } catch (err) {
+    if (claimAcquired && claimKey) {
+      try {
+        await completeSendClaim(claimKey, {
+          success: false,
+          response: `exception: ${err.message}`,
+        });
+      } catch {
+        /* ignore */
+      }
+    }
+    throw err;
   } finally {
     // Always release the in-flight lock.
     if (!skipIdempotency && orderIdStr) {
@@ -1883,12 +1962,39 @@ app.post(
   wrap(async (req, res) => {
     const rawBody = req.body; // Buffer (express.raw)
     const hmacHeader = req.get('X-Shopify-Hmac-Sha256');
+    // Shopify unique delivery id — same event retried => same id.
+    const shopifyWebhookId =
+      req.get('X-Shopify-Webhook-Id') ||
+      req.get('X-Shopify-Event-Id') ||
+      '';
 
     // 1. Verify HMAC against the RAW bytes.
     const valid = verifyWebhookHmac(rawBody, hmacHeader, config.shopify.apiSecret);
     if (!valid) {
       console.warn('[webhook] HMAC verification FAILED.');
       return res.status(401).json({ ok: false, error: 'HMAC verification failed' });
+    }
+
+    // 1b. Webhook-event idempotency: Shopify may redeliver the same
+    //     delivery (timeouts, 5xx). Claim the webhook id first so
+    //     retries never re-enter processOrder.
+    if (shopifyWebhookId) {
+      const whClaim = await tryAcquireSendClaim({
+        claimKey: webhookClaimKey(shopifyWebhookId),
+        kind: 'webhook',
+        webhookId: shopifyWebhookId,
+      });
+      if (!whClaim.acquired) {
+        console.log(
+          `[webhook] duplicate delivery ${shopifyWebhookId} skipped (${whClaim.reason})`
+        );
+        return res.status(200).json({
+          ok: true,
+          skipped: true,
+          reason: whClaim.reason || 'duplicate_webhook',
+          webhook_id: shopifyWebhookId,
+        });
+      }
     }
 
     // 2. Parse the order JSON defensively.
@@ -1900,6 +2006,12 @@ app.post(
     } catch {
       // Bad JSON: ack with 200 so Shopify doesn't retry forever, but log it.
       console.warn('[webhook] received invalid JSON body.');
+      if (shopifyWebhookId) {
+        await completeSendClaim(webhookClaimKey(shopifyWebhookId), {
+          success: false,
+          response: 'invalid json body',
+        });
+      }
       await insertLog({
         shopify_order_id: null,
         order_number: null,
@@ -1914,11 +2026,33 @@ app.post(
 
     // 3. Run the shared pipeline. Always answer 200 (Shopify needs a
     //    fast 2xx) — the outcome is captured in the message log.
+    //    processOrder itself claims confirm:<orderId>:<template>.
     try {
-      const result = await processOrder(order, { source: 'shopify-webhook' });
-      return res.status(200).json({ ok: true, result });
+      const result = await processOrder(order, {
+        source: 'shopify-webhook',
+        webhookId: shopifyWebhookId,
+      });
+      if (shopifyWebhookId) {
+        // Mark this Shopify *delivery* as handled so retries of the same
+        // X-Shopify-Webhook-Id never re-enter the pipeline. Soft send
+        // failures are retried by the confirm claim + catch-up, not by
+        // replaying the webhook.
+        await completeSendClaim(webhookClaimKey(shopifyWebhookId), {
+          success: true,
+          messageId: (result && result.messageId) || null,
+          response: (result && result.response) || 'processed',
+        });
+      }
+      return res.status(200).json({ ok: true, result, webhook_id: shopifyWebhookId || null });
     } catch (err) {
       console.error('[webhook] pipeline error:', err.message);
+      if (shopifyWebhookId) {
+        // Mark failed so a later legitimate redelivery can re-process.
+        await completeSendClaim(webhookClaimKey(shopifyWebhookId), {
+          success: false,
+          response: err.message,
+        });
+      }
       await insertLog({
         shopify_order_id: order && order.id,
         order_number: order && (order.name || order.order_number),
@@ -2115,7 +2249,24 @@ async function processInboundWhatsAppMessage(msg) {
   const from = String(msg.from || '').replace(/\D/g, '');
   if (!from) return;
 
-  // Button label from a template quick-reply OR an interactive reply.
+  // Meta may redeliver the same inbound message — claim wamid once.
+  const waMsgId = msg.id ? String(msg.id) : '';
+  if (waMsgId) {
+    const inClaim = await tryAcquireSendClaim({
+      claimKey: inboundClaimKey(waMsgId),
+      kind: 'inbound',
+    });
+    if (!inClaim.acquired) {
+      console.log(
+        `[whatsapp-inbound] duplicate wamid ${waMsgId} skipped (${inClaim.reason})`
+      );
+      return;
+    }
+  }
+
+  // Button label from a template quick-reply OR an interactive reply
+  // OR plain text that matches known phrases (customers sometimes type
+  // "أحتاج الي استفسار" instead of tapping the button).
   let label = '';
   if (msg.type === 'button' && msg.button) {
     label = msg.button.text || msg.button.payload || '';
@@ -2125,13 +2276,23 @@ async function processInboundWhatsAppMessage(msg) {
     msg.interactive.button_reply
   ) {
     label = msg.interactive.button_reply.title || msg.interactive.button_reply.id || '';
+  } else if (msg.type === 'text' && msg.text && msg.text.body) {
+    label = msg.text.body;
   }
   label = String(label || '').trim();
-  if (!label) return; // plain text/other inbound — ignore for now
+  if (!label) {
+    if (waMsgId) {
+      await completeSendClaim(inboundClaimKey(waMsgId), {
+        success: true,
+        response: 'ignored non-action inbound',
+      });
+    }
+    return;
+  }
 
   const orderId = await findRecentOrderByPhone(from);
   console.log(
-    `[whatsapp-inbound] from ${from} tapped "${label}" (order ${orderId || '?'})`
+    `[whatsapp-inbound] from ${from} tapped "${label}" (order ${orderId || '?'}) wamid=${waMsgId || '-'}`
   );
 
   // ---- Confirm order ----
@@ -2141,11 +2302,17 @@ async function processInboundWhatsAppMessage(msg) {
         to: from,
         text: 'لم نتمكن من ربط رقمك بطلب حديث. تواصل معنا من فضلك 🙏',
       });
+      if (waMsgId) {
+        await completeSendClaim(inboundClaimKey(waMsgId), {
+          success: true,
+          response: 'confirm no order',
+        });
+      }
       return;
     }
     const r = await confirmShopifyOrder(orderId);
     const ok = r && r.ok;
-    await metaSendText({
+    const txt = await metaSendText({
       to: from,
       text: ok
         ? 'تم تأكيد طلبك بنجاح ✅ جارٍ التجهيز والشحن 📦'
@@ -2160,40 +2327,88 @@ async function processInboundWhatsAppMessage(msg) {
       success: Boolean(ok),
       response: `[inbound] confirm -> ${
         ok ? (r.alreadyConfirmed ? 'already confirmed' : 'tagged confirmed') : (r && r.message) || 'failed'
-      }`,
+      } :: reply HTTP ${(txt && txt.httpStatus) || 0} msg ${(txt && txt.messageId) || '-'}`,
     });
+    if (waMsgId) {
+      await completeSendClaim(inboundClaimKey(waMsgId), {
+        success: true,
+        response: ok ? 'confirmed' : 'confirm failed',
+      });
+    }
     return;
   }
 
   // ---- Need inquiry -> send all products' images + details ----
-  if (/استفسار|inquiry|تعديل/i.test(label)) {
+  // Matches template button "أحتاج الي استفسار" and typed variants.
+  if (/استفسار|inquiry|تعديل|أحتاج\s*ال[يى]\s*استفسار/i.test(label)) {
     if (!orderId) {
       await metaSendText({
         to: from,
         text: 'لم نتمكن من ربط رقمك بطلب حديث. تواصل معنا من فضلك 🙏',
       });
+      if (waMsgId) {
+        await completeSendClaim(inboundClaimKey(waMsgId), {
+          success: true,
+          response: 'inquiry no order',
+        });
+      }
       return;
     }
+
+    // One inquiry reply pack per (order, inbound message).
+    const inqKey = inquiryClaimKey(orderId, waMsgId || `phone:${from}`);
+    const inqClaim = await tryAcquireSendClaim({
+      claimKey: inqKey,
+      kind: 'inquiry',
+      shopifyOrderId: orderId,
+    });
+    if (!inqClaim.acquired) {
+      console.log(
+        `[whatsapp-inbound] inquiry already handled for order ${orderId} (${inqClaim.reason})`
+      );
+      if (waMsgId) {
+        await completeSendClaim(inboundClaimKey(waMsgId), {
+          success: true,
+          response: `inquiry skipped ${inqClaim.reason}`,
+        });
+      }
+      return;
+    }
+
     const got = await fetchOrderById(orderId);
     if (!got.ok) {
       await metaSendText({
         to: from,
         text: 'تعذّر جلب تفاصيل الطلب حاليًا، حاول لاحقًا 🙏',
       });
+      await completeSendClaim(inqKey, { success: false, response: 'fetch order failed' });
       return;
     }
     const items = await getOrderItemsDetailed(got.order);
     if (!items.length) {
       await metaSendText({ to: from, text: 'لا توجد أصناف في هذا الطلب.' });
+      await completeSendClaim(inqKey, { success: true, response: 'no items' });
       return;
     }
     const MAX_SEND = 10; // cap outbound messages per inquiry
     const toSend = items.slice(0, MAX_SEND);
-    await metaSendText({
+    const intro = await metaSendText({
       to: from,
       text: `تفاصيل منتجات طلبك (${items.length} صنف) 👇`,
     });
+    await insertLog({
+      shopify_order_id: orderId,
+      order_number: got.order.name || got.order.order_number,
+      recipient_phone: from,
+      template_id: null,
+      variables: { action: 'inquiry_intro', items: items.length },
+      success: Boolean(intro && intro.success),
+      response: `[inbound] inquiry intro :: HTTP ${intro.httpStatus || 0} :: ${intro.raw || ''}`,
+    });
+
     let sent = 0;
+    let imagesSent = 0;
+    const itemResults = [];
     for (let i = 0; i < toSend.length; i++) {
       const it = toSend[i];
       const parts = [`${it.qty}x ${it.title}`];
@@ -2201,12 +2416,48 @@ async function processInboundWhatsAppMessage(msg) {
       if (it.color) parts.push(`اللون : ${it.color}`);
       const caption = `(${i + 1}/${items.length}) ${parts.join(' - ')}`;
       let r;
-      if (it.imageUrl) {
-        r = await metaSendImage({ to: from, imageUrl: it.imageUrl, caption });
+      const img =
+        toMetaSafeImageUrl(it.imageUrl) ||
+        normalizeImageUrl(it.imageUrl) ||
+        '';
+      if (img) {
+        r = await metaSendImage({ to: from, imageUrl: img, caption });
+        if (r && r.success) imagesSent += 1;
       } else {
-        r = await metaSendText({ to: from, text: caption });
+        // No product image — still send details as text (graceful).
+        r = await metaSendText({
+          to: from,
+          text: `${caption}\n(لا تتوفر صورة لهذا المنتج)`,
+        });
       }
       if (r && r.success) sent += 1;
+      itemResults.push({
+        title: it.title,
+        image: Boolean(img),
+        success: Boolean(r && r.success),
+        messageId: (r && r.messageId) || null,
+        httpStatus: (r && r.httpStatus) || 0,
+        raw: String((r && r.raw) || '').slice(0, 300),
+      });
+      await insertLog({
+        shopify_order_id: orderId,
+        order_number: got.order.name || got.order.order_number,
+        recipient_phone: from,
+        template_id: null,
+        variables: {
+          action: 'inquiry_item',
+          index: i + 1,
+          title: it.title,
+          imageUrl: img || null,
+          mediaId: (r && r.mediaId) || null,
+        },
+        success: Boolean(r && r.success),
+        response: `[inbound] inquiry item ${i + 1}/${items.length} :: HTTP ${
+          (r && r.httpStatus) || 0
+        } :: msg ${(r && r.messageId) || '-'} :: ${String((r && r.raw) || '').slice(0, 500)}`,
+      });
+      // Pace Meta free-form messages.
+      await sleep(350);
     }
     if (items.length > MAX_SEND) {
       await metaSendText({
@@ -2219,10 +2470,26 @@ async function processInboundWhatsAppMessage(msg) {
       order_number: got.order.name || got.order.order_number,
       recipient_phone: from,
       template_id: null,
-      variables: { action: 'inquiry', items: items.length, sent },
+      variables: {
+        action: 'inquiry',
+        items: items.length,
+        sent,
+        imagesSent,
+        itemResults,
+      },
       success: sent > 0,
-      response: `[inbound] inquiry -> sent ${sent}/${items.length} product messages`,
+      response: `[inbound] inquiry -> sent ${sent}/${items.length} product messages (${imagesSent} with images)`,
     });
+    await completeSendClaim(inqKey, {
+      success: sent > 0,
+      response: `sent ${sent}/${items.length} images=${imagesSent}`,
+    });
+    if (waMsgId) {
+      await completeSendClaim(inboundClaimKey(waMsgId), {
+        success: true,
+        response: `inquiry done sent=${sent}`,
+      });
+    }
     return;
   }
 

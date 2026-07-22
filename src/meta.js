@@ -720,12 +720,40 @@ async function sendRawMessage(payload) {
 }
 
 export async function sendImageMessage({ to, imageUrl, caption = '' }) {
-  if (!to || !/^https?:\/\//i.test(String(imageUrl || ''))) {
-    return { success: false, httpStatus: 0, raw: 'Missing recipient or image URL.' };
+  const link = toMetaSafeImageUrl(imageUrl) || normalizeImageUrl(imageUrl);
+  if (!to || !link) {
+    return {
+      success: false,
+      httpStatus: 0,
+      raw: 'Missing recipient or image URL.',
+      messageId: null,
+    };
   }
-  const image = { link: String(imageUrl) };
+
+  // Prefer media upload (PNG/JPEG bytes) so Meta never fails to fetch
+  // a CDN / former-webp link for free-form session messages.
+  const up = await uploadImageToMeta(link);
+  if (up.ok && up.mediaId) {
+    const image = { id: up.mediaId };
+    if (caption) image.caption = String(caption).slice(0, 1024);
+    const r = await sendRawMessage({ to: String(to), type: 'image', image });
+    return {
+      ...r,
+      imageSource: up.sourceUrl || link,
+      mediaId: up.mediaId,
+    };
+  }
+
+  // Fallback: public link (already normalized / format=png when possible).
+  const image = { link };
   if (caption) image.caption = String(caption).slice(0, 1024);
-  return sendRawMessage({ to: String(to), type: 'image', image });
+  const r = await sendRawMessage({ to: String(to), type: 'image', image });
+  return {
+    ...r,
+    imageSource: link,
+    mediaId: null,
+    uploadError: up.error || null,
+  };
 }
 
 export async function sendTextMessage({ to, text }) {

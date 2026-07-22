@@ -49,7 +49,12 @@ const memory = {
   logs: [],
   // Offline Shopify OAuth token (fallback when Supabase is degraded).
   shopifyAuth: null, // { shop, access_token, scope, obtained_at }
+  // Durable-enough for single process: claim_key -> claim row
+  claims: new Map(),
 };
+
+// Stale "claimed" rows older than this may be re-acquired (crashed worker).
+const CLAIM_STALE_MS = 10 * 60 * 1000;
 
 // ------------------------------------------------------------
 //  getConfig() -> { settings, mapping, selected_template_id, phone_number_id }
@@ -301,6 +306,13 @@ export async function hasSuccessfulLog(orderId, templateId) {
   );
   if (memHit) return true;
 
+  // Permanent claim marker (survives multi-instance when Supabase works).
+  if (tid) {
+    const claimKey = confirmClaimKey(oid, tid);
+    const claim = await getSendClaim(claimKey);
+    if (claim && claim.status === 'sent') return true;
+  }
+
   if (!client) return false;
   try {
     let q = client
@@ -320,6 +332,232 @@ export async function hasSuccessfulLog(orderId, templateId) {
     // Memory already checked above — do NOT return a false-negative that
     // would cause a duplicate WhatsApp send.
     return false;
+  }
+}
+
+// ------------------------------------------------------------
+//  Send claims — insert-wins idempotency
+// ------------------------------------------------------------
+export function confirmClaimKey(orderId, templateId) {
+  return `confirm:${String(orderId)}:${String(templateId || '')}`;
+}
+
+export function webhookClaimKey(webhookId) {
+  return `webhook:${String(webhookId)}`;
+}
+
+export function inboundClaimKey(messageId) {
+  return `inbound:${String(messageId)}`;
+}
+
+export function inquiryClaimKey(orderId, messageId) {
+  return `inquiry:${String(orderId)}:${String(messageId || 'na')}`;
+}
+
+async function getSendClaim(claimKey) {
+  const key = String(claimKey || '');
+  if (!key) return null;
+  if (memory.claims.has(key)) return memory.claims.get(key);
+  if (!client) return null;
+  try {
+    const { data, error } = await client
+      .from('send_claims')
+      .select('*')
+      .eq('claim_key', key)
+      .maybeSingle();
+    if (error) throw error;
+    if (data) {
+      memory.claims.set(key, data);
+      return data;
+    }
+  } catch (err) {
+    // Table may not exist yet on older deploys — degrade gracefully.
+    if (!/relation .* does not exist|Could not find the table/i.test(err.message || '')) {
+      console.warn('[supabase] getSendClaim failed:', err.message);
+    }
+  }
+  return null;
+}
+
+/**
+ * tryAcquireSendClaim({ claimKey, kind, shopifyOrderId, webhookId, templateId })
+ * Insert-wins. Returns:
+ *   { acquired: true }
+ *   { acquired: false, reason: 'already_sent'|'in_progress'|'duplicate', existing }
+ */
+export async function tryAcquireSendClaim({
+  claimKey,
+  kind,
+  shopifyOrderId = null,
+  webhookId = null,
+  templateId = null,
+} = {}) {
+  const key = String(claimKey || '').trim();
+  if (!key) return { acquired: false, reason: 'missing_key' };
+
+  const now = Date.now();
+  const existing = await getSendClaim(key);
+  if (existing) {
+    if (existing.status === 'sent') {
+      return { acquired: false, reason: 'already_sent', existing };
+    }
+    if (existing.status === 'claimed') {
+      const age =
+        now - (Date.parse(existing.updated_at || existing.created_at || '') || 0);
+      if (age < CLAIM_STALE_MS) {
+        return { acquired: false, reason: 'in_progress', existing };
+      }
+      // Stale claimed → re-acquire below.
+    }
+    // failed or stale claimed → allow re-claim
+  }
+
+  const row = {
+    claim_key: key,
+    kind: String(kind || 'confirm'),
+    shopify_order_id: shopifyOrderId != null ? String(shopifyOrderId) : null,
+    webhook_id: webhookId != null ? String(webhookId) : null,
+    template_id: templateId != null ? String(templateId) : null,
+    status: 'claimed',
+    message_id: null,
+    response: null,
+    created_at: new Date().toISOString(),
+    updated_at: new Date().toISOString(),
+  };
+
+  // Memory acquire (single-process / degraded mode).
+  const mem = memory.claims.get(key);
+  if (mem && mem.status === 'sent') {
+    return { acquired: false, reason: 'already_sent', existing: mem };
+  }
+  if (mem && mem.status === 'claimed') {
+    const age = now - (Date.parse(mem.updated_at || mem.created_at || '') || 0);
+    if (age < CLAIM_STALE_MS) {
+      return { acquired: false, reason: 'in_progress', existing: mem };
+    }
+  }
+  memory.claims.set(key, { ...row });
+
+  if (!client) return { acquired: true, claim: row };
+
+  try {
+    // Prefer insert; on conflict inspect existing row.
+    const { error } = await client.from('send_claims').insert(row);
+    if (!error) return { acquired: true, claim: row };
+
+    // Unique violation or other conflict — read winner.
+    const { data: winner, error: selErr } = await client
+      .from('send_claims')
+      .select('*')
+      .eq('claim_key', key)
+      .maybeSingle();
+    if (selErr) throw selErr;
+    if (winner) {
+      memory.claims.set(key, winner);
+      if (winner.status === 'sent') {
+        return { acquired: false, reason: 'already_sent', existing: winner };
+      }
+      if (winner.status === 'claimed') {
+        const age =
+          now - (Date.parse(winner.updated_at || winner.created_at || '') || 0);
+        if (age < CLAIM_STALE_MS) {
+          return { acquired: false, reason: 'in_progress', existing: winner };
+        }
+        // Re-claim stale row.
+        const { error: upErr } = await client
+          .from('send_claims')
+          .update({
+            status: 'claimed',
+            updated_at: new Date().toISOString(),
+            message_id: null,
+            response: null,
+          })
+          .eq('claim_key', key)
+          .eq('status', 'claimed');
+        if (!upErr) {
+          memory.claims.set(key, { ...winner, status: 'claimed' });
+          return { acquired: true, claim: { ...winner, status: 'claimed' } };
+        }
+        return { acquired: false, reason: 'in_progress', existing: winner };
+      }
+      // failed → update to claimed
+      const { error: up2 } = await client
+        .from('send_claims')
+        .update({
+          status: 'claimed',
+          updated_at: new Date().toISOString(),
+          message_id: null,
+          response: null,
+        })
+        .eq('claim_key', key);
+      if (!up2) {
+        memory.claims.set(key, { ...winner, status: 'claimed' });
+        return { acquired: true, claim: { ...winner, status: 'claimed' } };
+      }
+      return { acquired: false, reason: 'duplicate', existing: winner };
+    }
+    // No winner row — treat insert error as non-fatal acquire via memory.
+    return { acquired: true, claim: row };
+  } catch (err) {
+    if (!/relation .* does not exist|Could not find the table/i.test(err.message || '')) {
+      console.warn('[supabase] tryAcquireSendClaim failed (memory only):', err.message);
+    }
+    // Memory already holds the claim.
+    return { acquired: true, claim: row, degraded: true };
+  }
+}
+
+export async function completeSendClaim(
+  claimKey,
+  { success, messageId = null, response = null } = {}
+) {
+  const key = String(claimKey || '').trim();
+  if (!key) return;
+  const status = success ? 'sent' : 'failed';
+  const updated_at = new Date().toISOString();
+  const prev = memory.claims.get(key) || { claim_key: key };
+  const next = {
+    ...prev,
+    status,
+    message_id: messageId != null ? String(messageId) : prev.message_id || null,
+    response: response != null ? String(response).slice(0, 2000) : prev.response || null,
+    updated_at,
+  };
+  // On failure, drop memory claim so retries can re-acquire quickly.
+  if (success) memory.claims.set(key, next);
+  else memory.claims.delete(key);
+
+  if (!client) return;
+  try {
+    if (success) {
+      await client.from('send_claims').upsert(
+        {
+          claim_key: key,
+          kind: next.kind || 'confirm',
+          shopify_order_id: next.shopify_order_id || null,
+          webhook_id: next.webhook_id || null,
+          template_id: next.template_id || null,
+          status: 'sent',
+          message_id: next.message_id,
+          response: next.response,
+          updated_at,
+        },
+        { onConflict: 'claim_key' }
+      );
+    } else {
+      await client
+        .from('send_claims')
+        .update({
+          status: 'failed',
+          response: next.response,
+          updated_at,
+        })
+        .eq('claim_key', key);
+    }
+  } catch (err) {
+    if (!/relation .* does not exist|Could not find the table/i.test(err.message || '')) {
+      console.warn('[supabase] completeSendClaim failed:', err.message);
+    }
   }
 }
 
@@ -445,6 +683,12 @@ export default {
   listLogsPaged,
   successfulOrderIdSet,
   hasSuccessfulLog,
+  confirmClaimKey,
+  webhookClaimKey,
+  inboundClaimKey,
+  inquiryClaimKey,
+  tryAcquireSendClaim,
+  completeSendClaim,
   findRecentOrderByPhone,
   getShopifyAuth,
   saveShopifyAuth,

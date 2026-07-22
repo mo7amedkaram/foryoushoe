@@ -1052,6 +1052,8 @@ export async function markOrderPending(orderId) {
 // ------------------------------------------------------------
 //  getOrderItemsDetailed(order) -> [{ qty, title, size, color,
 //  imageUrl }]  (one entry per line item, with the variant image)
+//  imageUrl is always absolute https and prefers PNG via Shopify CDN
+//  conversion so WhatsApp free-form image messages deliver reliably.
 // ------------------------------------------------------------
 export async function getOrderItemsDetailed(order) {
   const items = Array.isArray(order && order.line_items)
@@ -1059,14 +1061,13 @@ export async function getOrderItemsDetailed(order) {
     : [];
   const norm = (s) => String(s == null ? '' : s).trim();
   const cache = new Map();
-  const getProduct = async (pid) => {
-    if (!pid) return null;
-    if (cache.has(pid)) return cache.get(pid);
-    const res = await adminApiGet(
-      `products/${pid}.json?fields=id,image,images,options,variants`
-    );
-    const p = res && res.ok && res.data ? res.data.product : null;
-    cache.set(pid, p || null);
+  const getProduct = async (pid, handle = '') => {
+    const key = pid ? `id:${pid}` : handle ? `h:${handle}` : '';
+    if (!key) return null;
+    if (cache.has(key)) return cache.get(key);
+    // Reuse the shared product fetcher (Admin API + public catalog).
+    const p = await fetchProductById(pid, handle);
+    cache.set(key, p || null);
     return p;
   };
   const out = [];
@@ -1077,7 +1078,18 @@ export async function getOrderItemsDetailed(order) {
     let size = '';
     let color = '';
     let imageUrl = '';
-    const p = await getProduct(li.product_id ? String(li.product_id) : '');
+    // Line-item images first (some payloads carry them).
+    imageUrl =
+      normalizeShopifyImageUrl(
+        (li.image && (li.image.src || li.image.url || li.image)) ||
+          li.image_url ||
+          li.product_image ||
+          ''
+      ) || '';
+
+    const pid = li.product_id ? String(li.product_id) : '';
+    const handle = li.handle || li.product_handle || '';
+    const p = await getProduct(pid, handle);
     if (p) {
       const opts = Array.isArray(p.options) ? p.options : [];
       const variants = Array.isArray(p.variants) ? p.variants : [];
@@ -1089,19 +1101,41 @@ export async function getOrderItemsDetailed(order) {
         if (/colou?r|لون/i.test(o.name)) color = val;
         else if (/size|مقاس/i.test(o.name)) size = val;
       }
-      const images = Array.isArray(p.images) ? p.images : [];
-      if (v && v.image_id) {
-        const vi = images.find((im) => String(im.id) === String(v.image_id));
-        if (vi && vi.src) imageUrl = vi.src;
+      if (!imageUrl) {
+        imageUrl = pickImageSrcFromProduct(
+          p,
+          li.variant_id ? String(li.variant_id) : ''
+        );
       }
-      if (!imageUrl && p.image && p.image.src) imageUrl = p.image.src;
-      if (!imageUrl && images[0] && images[0].src) imageUrl = images[0].src;
     }
     if (!size && !color && norm(li.variant_title)) {
       // last resort label-less
       size = norm(li.variant_title);
     }
-    out.push({ qty, title, size, color, imageUrl });
+    // Force https + PNG format for Shopify CDN so WhatsApp accepts it.
+    if (imageUrl) {
+      let safe = normalizeShopifyImageUrl(imageUrl);
+      if (/cdn\.shopify\.com|\/cdn\/shop\//i.test(safe)) {
+        try {
+          const u = new URL(safe);
+          u.searchParams.set('format', 'png');
+          if (!u.searchParams.has('width')) u.searchParams.set('width', '1200');
+          safe = u.toString();
+        } catch {
+          safe = safe.includes('?') ? `${safe}&format=png` : `${safe}?format=png`;
+        }
+      }
+      imageUrl = safe;
+    }
+    out.push({
+      qty,
+      title,
+      size,
+      color,
+      imageUrl,
+      productId: pid,
+      variantId: li.variant_id ? String(li.variant_id) : '',
+    });
   }
   return out;
 }

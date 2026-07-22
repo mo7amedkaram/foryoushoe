@@ -46,6 +46,38 @@ create index if not exists message_log_order_template_idx
   on public.message_log (shopify_order_id, template_id, success);
 
 -- ------------------------------------------------------------
+--  send_claims : durable idempotency for multi-instance Railway.
+--  claim_key examples:
+--    confirm:<shopify_order_id>:<template>
+--    webhook:<X-Shopify-Webhook-Id>
+--    inbound:<wamid>
+--    inquiry:<order_id>:<wamid>
+--  Insert-wins: only the first worker acquires the claim.
+-- ------------------------------------------------------------
+create table if not exists public.send_claims (
+  claim_key        text primary key,
+  kind             text        not null,
+  shopify_order_id text,
+  webhook_id       text,
+  template_id      text,
+  status           text        not null default 'claimed',
+  message_id       text,
+  response         text,
+  created_at       timestamptz not null default now(),
+  updated_at       timestamptz not null default now(),
+  constraint send_claims_status_chk
+    check (status in ('claimed', 'sent', 'failed'))
+);
+
+create index if not exists send_claims_order_idx
+  on public.send_claims (shopify_order_id, kind, status);
+
+create index if not exists send_claims_webhook_idx
+  on public.send_claims (webhook_id);
+
+alter table public.send_claims enable row level security;
+
+-- ------------------------------------------------------------
 --  shopify_auth : single-row store of the Shopify Admin API
 --  access token. The app uses the CLIENT-CREDENTIALS grant, whose
 --  token expires (~24h) — `expires_at` lets the app refresh it
