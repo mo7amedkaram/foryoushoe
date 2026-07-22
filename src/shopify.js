@@ -280,18 +280,27 @@ export const resolvers = {
     // processOrder / the preview enrich the order with
     // `productImageUrl` (resolved via the Admin API). Prefer that;
     // fall back to any image fields that happen to be present.
+    // Protocol-relative CDN URLs ("//cdn...") are upgraded to https.
     fn: (order) => {
+      const norm = (u) => {
+        if (u == null) return '';
+        let s = String(u).trim();
+        if (!s) return '';
+        if (s.startsWith('//')) s = `https:${s}`;
+        return /^https?:\/\//i.test(s) ? s : '';
+      };
       if (order && order.productImageUrl) {
-        return String(order.productImageUrl).trim();
+        const u = norm(order.productImageUrl);
+        if (u) return u;
       }
       const items = Array.isArray(order.line_items) ? order.line_items : [];
       const li = items[0] || {};
-      return String(
-        (li.image && (li.image.src || li.image)) ||
-          li.image_url ||
-          li.product_image ||
-          ''
-      ).trim();
+      return (
+        norm(li.image && (li.image.src || li.image.url || li.image)) ||
+        norm(li.image_url) ||
+        norm(li.product_image) ||
+        ''
+      );
     },
   },
   trackingNumber: {

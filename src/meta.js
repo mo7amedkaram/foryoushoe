@@ -126,6 +126,15 @@ export function parseMetaTemplate(raw) {
     variables.push({ index: i, name });
   }
 
+  const headerComp =
+    components.find((c) => c && String(c.type).toUpperCase() === 'HEADER') ||
+    null;
+  // HEADER.format is IMAGE | TEXT | VIDEO | DOCUMENT when present.
+  const headerFormat = headerComp
+    ? String(headerComp.format || headerComp.type || '').toUpperCase()
+    : '';
+  const requiresImageHeader = headerFormat === 'IMAGE';
+
   const buttonsComp =
     components.find((c) => c && String(c.type).toUpperCase() === 'BUTTONS') ||
     null;
@@ -151,11 +160,40 @@ export function parseMetaTemplate(raw) {
     status: raw.status || '',
     parameterFormat: raw.parameter_format || 'POSITIONAL',
     body: bodyText,
+    headerFormat,
+    requiresImageHeader,
     variables,
     bodyParamCount: maxIndex,
     urlButtons,
     raw,
   };
+}
+
+// Shopify CDN and many storefronts emit protocol-relative image URLs
+// ("//cdn.shopify.com/..."). Meta only accepts absolute http(s) links.
+export function normalizeImageUrl(input) {
+  if (input == null) return '';
+  let s = String(input).trim();
+  if (!s) return '';
+  if (s.startsWith('//')) s = `https:${s}`;
+  // Rare absolute-without-scheme forms from some feeds.
+  if (/^cdn\.shopify\.com\//i.test(s) || /^[\w.-]+\.myshopify\.com\//i.test(s)) {
+    s = `https://${s}`;
+  }
+  if (!/^https?:\/\//i.test(s)) return '';
+  // Drop accidental whitespace/newlines that break the Graph API.
+  s = s.replace(/[\r\n\t\s]+/g, '');
+  return s;
+}
+
+function isImageHeaderError(rawOrError) {
+  const s = String(rawOrError || '');
+  return (
+    /132012/.test(s) ||
+    /expected IMAGE/i.test(s) ||
+    /header:\s*Format mismatch/i.test(s) ||
+    /Parameter format does not match/i.test(s)
+  );
 }
 
 // ------------------------------------------------------------
@@ -255,63 +293,38 @@ function fitParamsToBodyLimit(texts, fixedLen, { max = 1024, margin = 24 } = {})
 //  Returns { success, httpStatus, raw, parsed, messageId }.
 //  Never throws.
 // ------------------------------------------------------------
-export async function sendTemplateMessage({
+function buildTemplatePayload({
   to,
   templateName,
-  languageCode = 'en',
-  orderedValues = [],
-  headerImageUrl = '',
-  buttonUrlText = '',
-  buttonUrlIndex = '0',
+  langCode,
+  texts,
+  headerImageUrl,
+  requireImageHeader,
+  buttonUrlText,
+  buttonUrlIndex,
 }) {
-  if (!isMetaConfigured()) {
-    return {
-      success: false,
-      httpStatus: 0,
-      raw: 'META not configured (META_ACCESS_TOKEN / META_PHONE_NUMBER_ID).',
-    };
-  }
-  if (!to) {
-    return { success: false, httpStatus: 0, raw: 'Missing recipient phone.' };
-  }
-  if (!templateName) {
-    return { success: false, httpStatus: 0, raw: 'Missing template name.' };
-  }
-
-  let texts = orderedValues.map((v) => sanitizeParam(v));
-  // Keep the rendered body under WhatsApp's 1024-char limit by
-  // trimming only the longest free-text params when necessary. Also
-  // self-correct the language code from the live template so a
-  // mismatched META_TEMPLATE_LANG can't fail every send (132001).
-  let langCode = languageCode || 'en';
-  try {
-    const tm = await getTemplateMeta(templateName);
-    if (tm && tm.ok && tm.template) {
-      if (tm.template.language) langCode = tm.template.language;
-      if (tm.template.body) {
-        const fixed = String(tm.template.body).replace(
-          /\{\{\s*\d+\s*\}\}/g,
-          ''
-        );
-        texts = fitParamsToBodyLimit(texts, fixed.length);
-      }
-    }
-  } catch {
-    /* best effort — send unfitted if the template fetch fails */
-  }
-
   const parameters = texts.map((t) => ({ type: 'text', text: t }));
-
   const components = [];
-  // IMAGE header (e.g. order_confirm_iamge): the product photo.
-  if (headerImageUrl && /^https?:\/\//i.test(String(headerImageUrl))) {
+  const imageLink = normalizeImageUrl(headerImageUrl);
+
+  // Templates with an IMAGE header (order_confirm_iamge) MUST receive
+  // a header component of type image. Omitting it produces Meta
+  // error 132012: "expected IMAGE, received UNKNOWN".
+  if (imageLink) {
     components.push({
       type: 'header',
-      parameters: [
-        { type: 'image', image: { link: String(headerImageUrl) } },
-      ],
+      parameters: [{ type: 'image', image: { link: imageLink } }],
     });
+  } else if (requireImageHeader) {
+    // Caller should avoid this path; surface a clear local error
+    // instead of a cryptic Meta 132012.
+    return {
+      error:
+        'Template requires an IMAGE header but no usable image URL was provided. ' +
+        'Set META_FALLBACK_IMAGE or ensure product images resolve from Shopify.',
+    };
   }
+
   if (parameters.length) {
     components.push({ type: 'body', parameters });
   }
@@ -324,18 +337,23 @@ export async function sendTemplateMessage({
     });
   }
 
-  const payload = {
-    messaging_product: 'whatsapp',
-    recipient_type: 'individual',
-    to: String(to),
-    type: 'template',
-    template: {
-      name: templateName,
-      language: { code: langCode || 'en' },
-      components,
+  return {
+    payload: {
+      messaging_product: 'whatsapp',
+      recipient_type: 'individual',
+      to: String(to),
+      type: 'template',
+      template: {
+        name: templateName,
+        language: { code: langCode || 'en' },
+        components,
+      },
     },
+    imageLink,
   };
+}
 
+async function postTemplatePayload(payload) {
   const url = `${graphBase()}/${config.meta.phoneNumberId}/messages`;
   let res;
   try {
@@ -352,6 +370,9 @@ export async function sendTemplateMessage({
       success: false,
       httpStatus: 0,
       raw: `Send request failed: ${err.message}`,
+      parsed: null,
+      messageId: null,
+      messageStatus: null,
     };
   }
 
@@ -387,7 +408,140 @@ export async function sendTemplateMessage({
     parsed: json,
     messageId: messageId || null,
     messageStatus: msgStatus || null,
+    graphError,
   };
+}
+
+export async function sendTemplateMessage({
+  to,
+  templateName,
+  languageCode = 'en',
+  orderedValues = [],
+  headerImageUrl = '',
+  fallbackImageUrl = '',
+  buttonUrlText = '',
+  buttonUrlIndex = '0',
+  // When true (default for order_confirm_iamge), always require IMAGE.
+  forceImageHeader = null,
+}) {
+  if (!isMetaConfigured()) {
+    return {
+      success: false,
+      httpStatus: 0,
+      raw: 'META not configured (META_ACCESS_TOKEN / META_PHONE_NUMBER_ID).',
+    };
+  }
+  if (!to) {
+    return { success: false, httpStatus: 0, raw: 'Missing recipient phone.' };
+  }
+  if (!templateName) {
+    return { success: false, httpStatus: 0, raw: 'Missing template name.' };
+  }
+
+  let texts = orderedValues.map((v) => sanitizeParam(v));
+  // Keep the rendered body under WhatsApp's 1024-char limit by
+  // trimming only the longest free-text params when necessary. Also
+  // self-correct the language code from the live template so a
+  // mismatched META_TEMPLATE_LANG can't fail every send (132001).
+  let langCode = languageCode || 'en';
+  let requireImageHeader =
+    forceImageHeader == null
+      ? // Default: known IMAGE-header confirmation templates.
+        /order_confirm/i.test(String(templateName || ''))
+      : Boolean(forceImageHeader);
+
+  try {
+    const tm = await getTemplateMeta(templateName);
+    if (tm && tm.ok && tm.template) {
+      if (tm.template.language) langCode = tm.template.language;
+      if (tm.template.requiresImageHeader != null) {
+        requireImageHeader = Boolean(tm.template.requiresImageHeader);
+      } else if (tm.template.headerFormat === 'IMAGE') {
+        requireImageHeader = true;
+      }
+      if (tm.template.body) {
+        const fixed = String(tm.template.body).replace(
+          /\{\{\s*\d+\s*\}\}/g,
+          ''
+        );
+        texts = fitParamsToBodyLimit(texts, fixed.length);
+      }
+    }
+  } catch {
+    /* best effort — send unfitted if the template fetch fails */
+  }
+
+  const primary = normalizeImageUrl(headerImageUrl);
+  const fallback = normalizeImageUrl(
+    fallbackImageUrl || config.meta.fallbackImage || ''
+  );
+  // Prefer product image; fall back to META_FALLBACK_IMAGE so IMAGE
+  // templates never go out without a header component.
+  let imageToUse = primary || fallback;
+
+  if (requireImageHeader && !imageToUse) {
+    return {
+      success: false,
+      httpStatus: 0,
+      raw:
+        'Template requires IMAGE header but no product image or META_FALLBACK_IMAGE is available.',
+      messageId: null,
+      headerImageUsed: '',
+    };
+  }
+
+  const built = buildTemplatePayload({
+    to,
+    templateName,
+    langCode,
+    texts,
+    headerImageUrl: imageToUse,
+    requireImageHeader,
+    buttonUrlText,
+    buttonUrlIndex,
+  });
+  if (built.error) {
+    return {
+      success: false,
+      httpStatus: 0,
+      raw: built.error,
+      messageId: null,
+      headerImageUsed: '',
+    };
+  }
+
+  let result = await postTemplatePayload(built.payload);
+  result.headerImageUsed = built.imageLink || '';
+
+  // If Meta rejects the product image (404/unsupported format/size),
+  // retry once with the configured fallback image when different.
+  if (
+    !result.success &&
+    requireImageHeader &&
+    fallback &&
+    fallback !== imageToUse &&
+    isImageHeaderError(result.raw)
+  ) {
+    const retry = buildTemplatePayload({
+      to,
+      templateName,
+      langCode,
+      texts,
+      headerImageUrl: fallback,
+      requireImageHeader: true,
+      buttonUrlText,
+      buttonUrlIndex,
+    });
+    if (!retry.error) {
+      const second = await postTemplatePayload(retry.payload);
+      second.headerImageUsed = retry.imageLink || '';
+      second.retriedWithFallback = true;
+      second.primaryImageError = result.raw;
+      result = second;
+    }
+  }
+
+  return result;
 }
 
 // ------------------------------------------------------------
@@ -459,5 +613,6 @@ export default {
   listTemplatesMeta,
   getTemplateMeta,
   parseMetaTemplate,
+  normalizeImageUrl,
   sendTemplateMessage,
 };

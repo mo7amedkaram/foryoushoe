@@ -268,10 +268,47 @@ export async function getAdminToken() {
 //  in ~24h, we transparently (re)generate one via client credentials
 //  when the stored token is missing or within 5 minutes of expiry.
 //  Falls back to a possibly-stale stored token rather than nothing.
+//
+//  Concurrent callers share a single in-flight refresh (single-flight)
+//  so a burst of webhooks cannot stampede the token endpoint.
 // ------------------------------------------------------------
 const EXPIRY_SKEW_MS = 5 * 60 * 1000;
+let refreshInFlight = null;
 
-export async function ensureAdminToken() {
+async function refreshClientCredentialsToken(preferredShop) {
+  const fresh = await getClientCredentialsToken({
+    shop: preferredShop || config.shopify.shopDomain,
+  });
+  if (!fresh.ok) {
+    console.warn(
+      `[shopify] client-credentials refresh failed: ${fresh.error || 'unknown'}`
+    );
+    return null;
+  }
+
+  try {
+    await saveShopifyAuth({
+      shop: fresh.shop,
+      access_token: fresh.access_token,
+      scope: fresh.scope,
+      expires_at: fresh.expires_at,
+    });
+  } catch {
+    /* memory fallback inside saveShopifyAuth already handled it */
+  }
+  console.log(
+    `[shopify] access token refreshed for ${fresh.shop} ` +
+      `(expires_in≈${fresh.expires_in}s)`
+  );
+  return {
+    shop: fresh.shop,
+    access_token: fresh.access_token,
+    scope: fresh.scope,
+    expires_at: fresh.expires_at,
+  };
+}
+
+export async function ensureAdminToken({ forceRefresh = false } = {}) {
   // Highest priority: a static Admin API token from .env (e.g. a
   // store custom app shpat_ token with read_products). No expiry,
   // no client-credentials needed.
@@ -293,35 +330,42 @@ export async function ensureAdminToken() {
 
   const expMs = auth && auth.expires_at ? Date.parse(auth.expires_at) : NaN;
   const stillValid =
+    !forceRefresh &&
     auth &&
     auth.access_token &&
     (!Number.isFinite(expMs) || expMs - Date.now() > EXPIRY_SKEW_MS);
   if (stillValid) return auth;
 
-  const fresh = await getClientCredentialsToken({
-    shop: (auth && auth.shop) || config.shopify.shopDomain,
-  });
-  if (!fresh.ok) {
-    // Could not refresh — better to try a stale token than fail hard.
-    return auth && auth.access_token ? auth : null;
-  }
-
-  try {
-    await saveShopifyAuth({
-      shop: fresh.shop,
-      access_token: fresh.access_token,
-      scope: fresh.scope,
-      expires_at: fresh.expires_at,
+  // Single-flight refresh so concurrent order webhooks share one grant.
+  if (!refreshInFlight) {
+    refreshInFlight = refreshClientCredentialsToken(
+      (auth && auth.shop) || config.shopify.shopDomain
+    ).finally(() => {
+      refreshInFlight = null;
     });
-  } catch {
-    /* memory fallback inside saveShopifyAuth already handled it */
   }
-  return {
-    shop: fresh.shop,
-    access_token: fresh.access_token,
-    scope: fresh.scope,
-    expires_at: fresh.expires_at,
-  };
+  const refreshed = await refreshInFlight;
+  if (refreshed) return refreshed;
+
+  // Could not refresh — better to try a stale token than fail hard.
+  return auth && auth.access_token ? auth : null;
+}
+
+// Proactive keepalive for Railway: call on a timer so the stored
+// client-credentials token never sits expired between quiet periods.
+export async function keepShopifyTokenAlive() {
+  if (config.shopify.adminToken) {
+    return { ok: true, mode: 'static' };
+  }
+  const auth = await ensureAdminToken();
+  if (auth && auth.access_token) {
+    return {
+      ok: true,
+      mode: 'client_credentials',
+      expires_at: auth.expires_at || null,
+    };
+  }
+  return { ok: false, error: 'NOT_CONNECTED' };
 }
 
 // ------------------------------------------------------------
@@ -380,14 +424,8 @@ export async function adminApiGet(path, { _retried = false } = {}) {
   if (res.status === 401 && !_retried) {
     // Token likely expired/revoked — force a brand-new client-
     // credentials token once, then retry the same request.
-    const fresh = await getClientCredentialsToken({ shop });
-    if (fresh.ok) {
-      await saveShopifyAuth({
-        shop: fresh.shop,
-        access_token: fresh.access_token,
-        scope: fresh.scope,
-        expires_at: fresh.expires_at,
-      });
+    const refreshed = await ensureAdminToken({ forceRefresh: true });
+    if (refreshed && refreshed.access_token) {
       return adminApiGet(path, { _retried: true });
     }
   }
@@ -473,45 +511,127 @@ export async function fetchLatestOrder() {
 }
 
 // ------------------------------------------------------------
-//  fetchProductImageUrl(order) -> "https://...jpg" | ''
+//  Image URL helpers + product image resolution
 //
-//  Shopify's order webhook line_items DON'T carry the product
-//  image. We resolve it from the Admin API: prefer the ordered
-//  variant's own image, then the product's featured image, then
-//  the first product image. Never throws — returns '' on any miss.
+//  Shopify's order webhook line_items usually DON'T carry the
+//  product image. We resolve it from the Admin API, then public
+//  catalog fallbacks. Protocol-relative CDN URLs are normalized
+//  to https so Meta accepts them as IMAGE header links.
 // ------------------------------------------------------------
+export function normalizeShopifyImageUrl(input) {
+  if (input == null) return '';
+  let s = String(input).trim();
+  if (!s) return '';
+  if (s.startsWith('//')) s = `https:${s}`;
+  if (/^cdn\.shopify\.com\//i.test(s)) s = `https://${s}`;
+  if (!/^https?:\/\//i.test(s)) return '';
+  return s.replace(/[\r\n\t\s]+/g, '');
+}
+
+function pickImageSrcFromProduct(product, variantId = '') {
+  if (!product || typeof product !== 'object') return '';
+  const images = Array.isArray(product.images) ? product.images : [];
+  if (variantId && Array.isArray(product.variants)) {
+    const v = product.variants.find((x) => String(x.id) === String(variantId));
+    if (v && v.image_id) {
+      const vi = images.find((im) => String(im.id) === String(v.image_id));
+      if (vi && vi.src) return normalizeShopifyImageUrl(vi.src);
+    }
+  }
+  if (product.image && product.image.src) {
+    return normalizeShopifyImageUrl(product.image.src);
+  }
+  if (images[0] && images[0].src) {
+    return normalizeShopifyImageUrl(images[0].src);
+  }
+  return '';
+}
+
+function imageFromLineItem(li) {
+  if (!li || typeof li !== 'object') return '';
+  const candidates = [
+    li.image && (li.image.src || li.image.url || li.image),
+    li.image_url,
+    li.product_image,
+    li.featured_image && (li.featured_image.src || li.featured_image.url),
+  ];
+  for (const c of candidates) {
+    const u = normalizeShopifyImageUrl(c);
+    if (u) return u;
+  }
+  return '';
+}
+
+// Public storefront catalog fallback. Paginate products.json so we
+// do not miss products beyond the first 250 (previous hard limit).
 async function fetchPublicCatalogProduct(productId) {
   const shop = config.shopify.shopDomain;
-  if (!isValidShop(shop)) return null;
+  if (!isValidShop(shop) || !productId) return null;
+  const target = String(productId);
 
   try {
-    const response = await fetchWithTimeout(
-      `https://${shop}/products.json?limit=250`
-    );
-    if (!response.ok) return null;
-    const catalog = safeJsonParse(await response.text(), null);
-    const products = Array.isArray(catalog && catalog.products)
-      ? catalog.products
-      : [];
-    return (
-      products.find((product) => String(product.id) === String(productId)) || null
-    );
+    // page 1..10 * 250 = up to 2500 products without Admin auth.
+    for (let page = 1; page <= 10; page++) {
+      const response = await fetchWithTimeout(
+        `https://${shop}/products.json?limit=250&page=${page}`
+      );
+      if (!response.ok) return null;
+      const catalog = safeJsonParse(await response.text(), null);
+      const products = Array.isArray(catalog && catalog.products)
+        ? catalog.products
+        : [];
+      if (!products.length) return null;
+      const found = products.find((p) => String(p.id) === target);
+      if (found) return found;
+      if (products.length < 250) return null; // last page
+    }
   } catch (error) {
     if (error instanceof TypeError || error.name === 'AbortError') return null;
     throw error;
   }
+  return null;
 }
 
-async function fetchProductById(productId) {
-  const response = await adminApiGet(
-    `products/${productId}.json?fields=id,image,images,options,variants`
-  );
-  if (response.ok && response.data && response.data.product) {
-    return response.data.product;
+// Public product JSON by handle when present on the line item.
+async function fetchPublicProductByHandle(handle) {
+  const shop = config.shopify.shopDomain;
+  const h = String(handle || '')
+    .trim()
+    .replace(/^\/+|\/+$/g, '');
+  if (!isValidShop(shop) || !h) return null;
+  try {
+    const response = await fetchWithTimeout(
+      `https://${shop}/products/${encodeURIComponent(h)}.json`
+    );
+    if (!response.ok) return null;
+    const json = safeJsonParse(await response.text(), null);
+    return (json && json.product) || null;
+  } catch {
+    return null;
+  }
+}
+
+async function fetchProductById(productId, handle = '') {
+  if (productId) {
+    const response = await adminApiGet(
+      `products/${productId}.json?fields=id,image,images,options,variants,handle`
+    );
+    if (response.ok && response.data && response.data.product) {
+      return response.data.product;
+    }
   }
 
-  // Some Shopify app installations grant order access without product access.
-  return fetchPublicCatalogProduct(productId);
+  // Some Shopify app installations grant order access without product
+  // access, or the token is briefly unavailable. Fall back to public
+  // catalog endpoints that do not need Admin auth.
+  if (handle) {
+    const byHandle = await fetchPublicProductByHandle(handle);
+    if (byHandle) return byHandle;
+  }
+  if (productId) {
+    return fetchPublicCatalogProduct(productId);
+  }
+  return null;
 }
 
 export async function fetchProductImageUrl(order) {
@@ -519,29 +639,23 @@ export async function fetchProductImageUrl(order) {
     const items = Array.isArray(order && order.line_items)
       ? order.line_items
       : [];
-    const li = items.find((x) => x && x.product_id) || null;
+    // Prefer any image already present on line items (some API shapes).
+    for (const li of items) {
+      const direct = imageFromLineItem(li);
+      if (direct) return direct;
+    }
+
+    const li =
+      items.find((x) => x && (x.product_id || x.handle || x.product_handle)) ||
+      null;
     if (!li) return '';
 
-    const productId = String(li.product_id);
+    const productId = li.product_id ? String(li.product_id) : '';
     const variantId = li.variant_id ? String(li.variant_id) : '';
+    const handle = li.handle || li.product_handle || '';
 
-    const p = await fetchProductById(productId);
-    if (!p) return '';
-    const images = Array.isArray(p.images) ? p.images : [];
-
-    // 1. The exact variant's image, if the variant has one.
-    if (variantId && Array.isArray(p.variants)) {
-      const v = p.variants.find((x) => String(x.id) === variantId);
-      if (v && v.image_id) {
-        const vi = images.find((im) => String(im.id) === String(v.image_id));
-        if (vi && vi.src) return String(vi.src);
-      }
-    }
-    // 2. Product featured image.
-    if (p.image && p.image.src) return String(p.image.src);
-    // 3. First image as a last resort.
-    if (images[0] && images[0].src) return String(images[0].src);
-    return '';
+    const p = await fetchProductById(productId, handle);
+    return pickImageSrcFromProduct(p, variantId);
   } catch {
     return '';
   }
@@ -568,15 +682,32 @@ export async function enrichOrderFromShopify(order) {
 
     const norm = (s) => String(s == null ? '' : s).trim();
     const cache = new Map();
-    const getProduct = async (pid) => {
-      if (!pid) return null;
-      if (cache.has(pid)) return cache.get(pid);
-      const p = await fetchProductById(pid);
-      cache.set(pid, p || null);
+    const getProduct = async (pid, handle = '') => {
+      const key = pid ? `id:${pid}` : handle ? `h:${handle}` : '';
+      if (!key) return null;
+      if (cache.has(key)) return cache.get(key);
+      const p = await fetchProductById(pid, handle);
+      cache.set(key, p || null);
       return p;
     };
 
-    let imageSet = Boolean(order.productImageUrl);
+    // Normalize any pre-attached URL; also accept line-item images.
+    if (order.productImageUrl) {
+      order.productImageUrl =
+        normalizeShopifyImageUrl(order.productImageUrl) || order.productImageUrl;
+    }
+    let imageSet = Boolean(normalizeShopifyImageUrl(order.productImageUrl));
+    if (!imageSet) {
+      for (const li of items) {
+        const direct = imageFromLineItem(li);
+        if (direct) {
+          order.productImageUrl = direct;
+          imageSet = true;
+          break;
+        }
+      }
+    }
+
     const lines = [];
 
     // Cap to avoid hundreds of sequential Admin API calls on a
@@ -584,7 +715,9 @@ export async function enrichOrderFromShopify(order) {
     for (const li of items.slice(0, 25)) {
       const qty = li.quantity || 1;
       const title = norm(li.title || li.name) || 'item';
-      const p = await getProduct(li.product_id ? String(li.product_id) : '');
+      const pid = li.product_id ? String(li.product_id) : '';
+      const handle = li.handle || li.product_handle || '';
+      const p = await getProduct(pid, handle);
 
       let size = '';
       let color = '';
@@ -603,18 +736,12 @@ export async function enrichOrderFromShopify(order) {
         }
 
         if (!imageSet) {
-          const images = Array.isArray(p.images) ? p.images : [];
-          let src = '';
-          if (v && v.image_id) {
-            const vi = images.find(
-              (im) => String(im.id) === String(v.image_id)
-            );
-            if (vi && vi.src) src = vi.src;
-          }
-          if (!src && p.image && p.image.src) src = p.image.src;
-          if (!src && images[0] && images[0].src) src = images[0].src;
+          const src = pickImageSrcFromProduct(
+            p,
+            li.variant_id ? String(li.variant_id) : ''
+          );
           if (src) {
-            order.productImageUrl = String(src);
+            order.productImageUrl = src;
             imageSet = true;
           }
         }
@@ -631,7 +758,18 @@ export async function enrichOrderFromShopify(order) {
     }
 
     if (lines.length) order.formattedDescription = lines.join(' | ');
-  } catch {
+
+    // Final image pass if enrichment still missed it.
+    if (!normalizeShopifyImageUrl(order.productImageUrl)) {
+      const url = await fetchProductImageUrl(order);
+      if (url) order.productImageUrl = url;
+    }
+  } catch (err) {
+    console.warn(
+      `[shopify] enrichOrderFromShopify failed: ${
+        (err && err.message) || err
+      }`
+    );
     /* best effort — leave order unchanged on any failure */
   }
 }
@@ -668,14 +806,8 @@ export async function adminApiSend(method, path, body, { _retried = false } = {}
   const text = await res.text().catch(() => '');
   const json = safeJsonParse(text, null);
   if (res.status === 401 && !_retried) {
-    const fresh = await getClientCredentialsToken({ shop });
-    if (fresh.ok) {
-      await saveShopifyAuth({
-        shop: fresh.shop,
-        access_token: fresh.access_token,
-        scope: fresh.scope,
-        expires_at: fresh.expires_at,
-      });
+    const refreshed = await ensureAdminToken({ forceRefresh: true });
+    if (refreshed && refreshed.access_token) {
       return adminApiSend(method, path, body, { _retried: true });
     }
   }
@@ -924,6 +1056,7 @@ export default {
   getClientCredentialsToken,
   getAdminToken,
   ensureAdminToken,
+  keepShopifyTokenAlive,
   adminApiGet,
   adminApiSend,
   fetchLatestOrder,
@@ -935,6 +1068,7 @@ export default {
   getOrderItemsDetailed,
   fetchProductImageUrl,
   enrichOrderFromShopify,
+  normalizeShopifyImageUrl,
   CONFIRM_TAG,
   PENDING_TAG,
   CANCEL_TAG,

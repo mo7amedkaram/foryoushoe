@@ -53,18 +53,28 @@ Copy each value from your local `.env` into Railway. Do **not** commit `.env`.
 
 **Provider / Meta WhatsApp Cloud API**
 - `MESSAGE_PROVIDER` = `meta`
-- `META_ACCESS_TOKEN`
+- `META_ACCESS_TOKEN` — use a **System User** permanent token (or long-lived).
+  Short-lived user tokens expire and stop ALL sends until you update Railway.
 - `META_WABA_ID`
 - `META_PHONE_NUMBER_ID`
 - `META_API_VERSION` = `v22.0`
 - `META_TEMPLATE_NAME` = `order_confirm_iamge`
 - `META_TEMPLATE_LANG` = `en` (auto-corrected from the live template)
-- `META_FALLBACK_IMAGE` (optional)
+- `META_FALLBACK_IMAGE` — **required for reliability**. Public HTTPS JPEG/PNG
+  (store logo is ideal). Used when product image resolution fails so Meta
+  never gets error 132012 (`expected IMAGE, received UNKNOWN`).
 - `META_WEBHOOK_VERIFY_TOKEN` (any string; used in the Meta dashboard)
 - `META_APP_SECRET` — ⚠️ must be the App Secret of the Meta app that is
   **subscribed to the WABA** (App ID `2029610401309541`), NOT a different
   app. The inbound webhook signature is verified with this; a wrong app's
   secret makes every real Meta webhook get rejected.
+
+**Auto-send / token reliability (defaults are fine)**
+- `ORDER_CONFIRM_CRON_ENABLED` = `true` — catch-up for missed webhooks
+- `ORDER_CONFIRM_CRON_INTERVAL_MS` = `120000`
+- `SHOPIFY_TOKEN_KEEPALIVE_MS` = `1800000` — auto-refresh Shopify
+  client-credentials (~24h tokens) so product images keep resolving.
+  You should **not** need to click “Generate token” manually anymore.
 
 **Admin protection**
 - `ADMIN_UI_TOKEN` (already generated; the UI prompts for it once)

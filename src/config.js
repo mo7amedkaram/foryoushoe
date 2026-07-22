@@ -80,6 +80,33 @@ export const config = {
     ),
   },
 
+  // Catch-up for NEW order confirmations when the Shopify webhook is
+  // missed, delayed, or fails. Scans recent open orders and sends the
+  // confirmation template for any that do not yet have a successful
+  // message_log row. Idempotent via hasSuccessfulLog.
+  orderConfirm: {
+    cronEnabled: process.env.ORDER_CONFIRM_CRON_ENABLED !== 'false',
+    cronIntervalMs: Math.max(
+      parseInt(process.env.ORDER_CONFIRM_CRON_INTERVAL_MS || '120000', 10),
+      30000
+    ),
+    batchLimit: Math.min(
+      Math.max(parseInt(process.env.ORDER_CONFIRM_CRON_BATCH_LIMIT || '25', 10), 1),
+      100
+    ),
+    // Only consider orders created within this lookback window.
+    lookbackHours: Math.min(
+      Math.max(parseInt(process.env.ORDER_CONFIRM_LOOKBACK_HOURS || '48', 10), 1),
+      168
+    ),
+  },
+
+  // Proactively refresh Shopify client-credentials before they expire.
+  shopifyTokenKeepaliveMs: Math.max(
+    parseInt(process.env.SHOPIFY_TOKEN_KEEPALIVE_MS || '1800000', 10), // 30 min
+    60000
+  ),
+
   // Which provider sends the WhatsApp message: 'meta' (direct) | 'joud'.
   messageProvider: (process.env.MESSAGE_PROVIDER || 'meta').toLowerCase(),
 

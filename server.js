@@ -31,6 +31,7 @@ import {
   getPhoneNumbers as metaGetPhoneNumbers,
   listTemplatesMeta,
   getTemplateMeta,
+  normalizeImageUrl,
 } from './src/meta.js';
 import {
   verifyWebhookHmac,
@@ -54,6 +55,9 @@ import {
   markOrderPending,
   getOrderItemsDetailed,
   enrichOrderFromShopify,
+  fetchProductImageUrl,
+  normalizeShopifyImageUrl,
+  keepShopifyTokenAlive,
   adminApiGet,
   CONFIRM_TAG,
   PENDING_TAG,
@@ -1278,6 +1282,17 @@ async function processOrder(
     /* non-fatal: image / description just fall back */
   }
 
+  // Extra image resolution pass: enrichment can miss when the Admin
+  // token was cold. Never leave IMAGE-header templates without a URL.
+  if (!normalizeShopifyImageUrl(order.productImageUrl)) {
+    try {
+      const img = await fetchProductImageUrl(order);
+      if (img) order.productImageUrl = img;
+    } catch {
+      /* non-fatal */
+    }
+  }
+
   const { values } = resolveVariablesForOrder(order, mapping, settings);
   const phoneNumber = resolveRecipient();
 
@@ -1312,9 +1327,27 @@ async function processOrder(
     return '';
   });
 
-  // IMAGE header = the real product photo (enriched from Shopify).
+  // IMAGE header = product photo (enriched). Normalize protocol-relative
+  // CDN URLs. META_FALLBACK_IMAGE is used by meta.js when primary is empty
+  // or Meta rejects the product image (error 132012).
   const headerImageUrl =
-    order.productImageUrl || config.meta.fallbackImage || '';
+    normalizeImageUrl(order.productImageUrl) ||
+    normalizeImageUrl(
+      values.productImage ||
+        values.orderPhoto ||
+        (resolvers.productImage && resolvers.productImage.fn
+          ? resolvers.productImage.fn(order, settings)
+          : '')
+    ) ||
+    '';
+  const fallbackImageUrl = normalizeImageUrl(config.meta.fallbackImage) || '';
+
+  if (!headerImageUrl && !fallbackImageUrl) {
+    console.warn(
+      `[processOrder] #${order.name || order.order_number}: no product image ` +
+        `and META_FALLBACK_IMAGE is empty — IMAGE header templates will fail.`
+    );
+  }
 
   let sendResult;
   try {
@@ -1324,12 +1357,20 @@ async function processOrder(
       languageCode: config.meta.templateLang,
       orderedValues,
       headerImageUrl,
+      fallbackImageUrl,
+      forceImageHeader: true,
     });
     sendResult = {
       success: m.success,
       httpStatus: m.httpStatus,
       raw: m.messageId ? `msg ${m.messageId} :: ${m.raw}` : m.raw,
+      headerImageUsed: m.headerImageUsed || headerImageUrl || fallbackImageUrl,
+      retriedWithFallback: Boolean(m.retriedWithFallback),
     };
+    if (m.retriedWithFallback) {
+      sendResult.raw =
+        `${sendResult.raw} :: retried_with_fallback after: ${m.primaryImageError || ''}`;
+    }
   } catch (err) {
     sendResult = { success: false, raw: `send error: ${err.message}`, httpStatus: 0 };
   }
@@ -1339,7 +1380,12 @@ async function processOrder(
     order_number: order.name || order.order_number,
     recipient_phone: phoneNumber,
     template_id: templateId,
-    variables: { ...values, __headerImage: headerImageUrl },
+    variables: {
+      ...values,
+      __headerImage: sendResult.headerImageUsed || headerImageUrl,
+      __headerImagePrimary: headerImageUrl,
+      __headerImageFallback: fallbackImageUrl,
+    },
     success: sendResult.success,
     response: `[${source}] HTTP ${sendResult.httpStatus} :: ${sendResult.raw}`,
   };
@@ -2141,11 +2187,195 @@ process.on('uncaughtException', (err) => {
 });
 
 const server = app.listen(config.port, () => {
-  console.log(`\n  Shopify <-> joud.chat WhatsApp bridge`);
+  console.log(`\n  Shopify <-> WhatsApp (Meta) bridge`);
   console.log(`  Listening on http://localhost:${config.port}`);
   console.log(`  Supabase: ${isSupabaseEnabled() ? 'connected' : 'DEGRADED (in-memory)'}`);
   console.log(`  Webhook:  POST /webhooks/shopify/orders-create\n`);
 });
+
+// ------------------------------------------------------------
+//  Shopify client-credentials keepalive
+//  Tokens expire ~24h. Refresh proactively so product-image
+//  enrichment (and thus IMAGE headers) never goes cold.
+// ------------------------------------------------------------
+async function runShopifyTokenKeepalive(reason = 'timer') {
+  try {
+    const r = await keepShopifyTokenAlive();
+    if (!r.ok) {
+      console.warn(
+        `[shopify-token] keepalive (${reason}) failed: ${r.error || 'NOT_CONNECTED'}. ` +
+          'Order confirmation IMAGE headers may fail until credentials work.'
+      );
+    } else if (config.debug || reason === 'startup') {
+      console.log(
+        `[shopify-token] keepalive (${reason}) ok mode=${r.mode}` +
+          (r.expires_at ? ` expires_at=${r.expires_at}` : '')
+      );
+    }
+  } catch (err) {
+    console.warn(`[shopify-token] keepalive error: ${err.message}`);
+  }
+}
+
+// Fire immediately on boot so the first webhook after deploy has a token.
+runShopifyTokenKeepalive('startup');
+setInterval(
+  () => runShopifyTokenKeepalive('timer'),
+  config.shopifyTokenKeepaliveMs
+);
+
+// ------------------------------------------------------------
+//  Order-confirmation catch-up cron
+//  Webhooks can be missed (HMAC mismatch, deploy blip, Shopify
+//  retry exhaustion). Periodically send confirmations for recent
+//  open orders that have no successful message_log yet.
+// ------------------------------------------------------------
+let orderConfirmJobRunning = false;
+
+async function runOrderConfirmCatchUpJob({
+  source = 'order-confirm-cron',
+  limit = config.orderConfirm.batchLimit,
+} = {}) {
+  const cap = Math.min(
+    Math.max(parseInt(limit, 10) || config.orderConfirm.batchLimit, 1),
+    100
+  );
+  const lookbackMs = config.orderConfirm.lookbackHours * 60 * 60 * 1000;
+  const cutoff = Date.now() - lookbackMs;
+
+  // Prefer open unfulfilled/partial orders created recently. status=any
+  // + client filter so we also catch paid-but-not-yet-tagged ones.
+  const fetched = await adminApiGet(
+    'orders.json?status=open&limit=50&order=created_at+desc&fields=' +
+      encodeURIComponent(
+        'id,name,order_number,created_at,cancelled_at,phone,customer,' +
+          'shipping_address,billing_address,line_items,total_price,currency,' +
+          'financial_status,fulfillment_status,tags'
+      )
+  );
+  if (!fetched.ok) {
+    return {
+      ok: false,
+      error: fetched.error || 'FETCH_FAILED',
+      message: fetched.message || 'Could not fetch open orders for confirm catch-up.',
+      status: fetched.status,
+      scanned: 0,
+      attempted: 0,
+      sent: 0,
+      failed: 0,
+      skipped: 0,
+    };
+  }
+
+  const templateName = config.meta.templateName;
+  const all = Array.isArray(fetched.data && fetched.data.orders)
+    ? fetched.data.orders
+    : [];
+  const candidates = all.filter((o) => {
+    if (!o || o.cancelled_at) return false;
+    const created = Date.parse(o.created_at || '') || 0;
+    if (created && created < cutoff) return false;
+    // Skip already confirmed / cancelled via WhatsApp tags.
+    const st = statusFromTags(o.tags);
+    if (st === 'confirmed' || st === 'cancelled') return false;
+    return true;
+  });
+
+  let attempted = 0;
+  let sent = 0;
+  let failed = 0;
+  let skipped = 0;
+  const results = [];
+
+  for (const order of candidates) {
+    if (attempted >= cap) break;
+    try {
+      const already = await hasSuccessfulLog(order.id, templateName);
+      if (already) {
+        skipped += 1;
+        continue;
+      }
+      attempted += 1;
+      const out = await processOrder(order, { source });
+      if (out && out.skipped) {
+        skipped += 1;
+        results.push({
+          order_number: order.name || order.order_number,
+          success: true,
+          skipped: true,
+        });
+      } else if (out && out.success) {
+        sent += 1;
+        results.push({
+          order_number: order.name || order.order_number,
+          success: true,
+        });
+      } else {
+        failed += 1;
+        results.push({
+          order_number: order.name || order.order_number,
+          success: false,
+          response: (out && out.response) || 'send failed',
+        });
+      }
+      // Gentle pacing for Meta + Shopify rate limits.
+      await sleep(400);
+    } catch (err) {
+      failed += 1;
+      results.push({
+        order_number: order.name || order.order_number,
+        success: false,
+        response: err.message,
+      });
+    }
+  }
+
+  return {
+    ok: true,
+    scanned: candidates.length,
+    attempted,
+    sent,
+    failed,
+    skipped,
+    results,
+  };
+}
+
+async function runScheduledOrderConfirmJob() {
+  if (orderConfirmJobRunning) return;
+  orderConfirmJobRunning = true;
+  try {
+    const r = await runOrderConfirmCatchUpJob({ source: 'order-confirm-cron' });
+    if (!r.ok) {
+      console.warn(
+        `[order-confirm-cron] skipped: ${r.error || 'FETCH_FAILED'} ` +
+          `${r.message || ''}`.trim()
+      );
+    } else if (r.attempted || r.failed || config.debug) {
+      console.log(
+        `[order-confirm-cron] scanned=${r.scanned} attempted=${r.attempted} ` +
+          `sent=${r.sent} failed=${r.failed} skipped=${r.skipped}`
+      );
+    }
+  } catch (err) {
+    console.error('[order-confirm-cron] error:', err.message);
+  } finally {
+    orderConfirmJobRunning = false;
+  }
+}
+
+if (config.orderConfirm.cronEnabled) {
+  const interval = config.orderConfirm.cronIntervalMs;
+  console.log(
+    `  Order confirm cron: enabled every ${Math.round(interval / 1000)}s ` +
+      `(template=${config.meta.templateName}, lookback=${config.orderConfirm.lookbackHours}h)`
+  );
+  setInterval(runScheduledOrderConfirmJob, interval);
+  // First catch-up shortly after boot (give token keepalive a moment).
+  setTimeout(runScheduledOrderConfirmJob, 15000);
+} else {
+  console.log('  Order confirm cron: disabled');
+}
 
 let orderUpdateJobRunning = false;
 async function runScheduledOrderUpdateJob() {
