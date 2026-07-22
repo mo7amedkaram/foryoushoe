@@ -720,11 +720,14 @@ async function sendRawMessage(payload) {
 }
 
 export async function sendImageMessage({ to, imageUrl, caption = '' }) {
-  // Original working path (a5d5bad): send image by public HTTPS link.
-  // That is what Meta delivered for inquiry replies. Media-upload is only
-  // a fallback if the link is rejected.
-  let link = normalizeImageUrl(imageUrl) || toMetaSafeImageUrl(imageUrl);
-  if (!to || !link) {
+  // Inquiry multi-item sends often fail when Meta cannot fetch a raw
+  // .webp CDN link for the 2nd/3rd free-form image. Strategy:
+  //   1) Prefer media upload of PNG/JPEG (Meta always accepts id)
+  //   2) Try public link (raw + format=png)
+  //   3) Return failure so caller can try another URL / text
+  const rawLink = normalizeImageUrl(imageUrl);
+  const pngLink = toMetaSafeImageUrl(imageUrl) || rawLink;
+  if (!to || (!rawLink && !pngLink)) {
     return {
       success: false,
       httpStatus: 0,
@@ -733,37 +736,48 @@ export async function sendImageMessage({ to, imageUrl, caption = '' }) {
     };
   }
 
-  const image = { link };
-  if (caption) image.caption = String(caption).slice(0, 1024);
-  let r = await sendRawMessage({ to: String(to), type: 'image', image });
-  if (r.success) {
-    return { ...r, imageSource: link, mediaId: null };
+  const cap = caption ? String(caption).slice(0, 1024) : '';
+  const attempts = [];
+
+  // 1) Media upload — try PNG-converted URL first, then raw.
+  for (const src of [pngLink, rawLink].filter(Boolean)) {
+    const up = await uploadImageToMeta(src);
+    attempts.push(`upload:${src.slice(0, 60)}=>${up.ok ? up.mediaId : up.error}`);
+    if (up.ok && up.mediaId) {
+      const image = { id: up.mediaId };
+      if (cap) image.caption = cap;
+      const r = await sendRawMessage({ to: String(to), type: 'image', image });
+      if (r.success) {
+        return {
+          ...r,
+          imageSource: up.sourceUrl || src,
+          mediaId: up.mediaId,
+          attempts,
+        };
+      }
+      attempts.push(`send-id:${r.raw}`);
+    }
   }
 
-  // Fallback: re-encode via Shopify format=png + Meta media id.
-  const safe = toMetaSafeImageUrl(link) || link;
-  const up = await uploadImageToMeta(safe);
-  if (up.ok && up.mediaId) {
-    const byId = { id: up.mediaId };
-    if (caption) byId.caption = String(caption).slice(0, 1024);
-    const r2 = await sendRawMessage({
-      to: String(to),
-      type: 'image',
-      image: byId,
-    });
-    return {
-      ...r2,
-      imageSource: up.sourceUrl || safe,
-      mediaId: up.mediaId,
-      linkError: r.raw,
-    };
+  // 2) Public link fallback (original path).
+  for (const src of [pngLink, rawLink].filter(Boolean)) {
+    const image = { link: src };
+    if (cap) image.caption = cap;
+    const r = await sendRawMessage({ to: String(to), type: 'image', image });
+    attempts.push(`link:${src.slice(0, 60)}=>${r.success ? r.messageId : r.raw}`);
+    if (r.success) {
+      return { ...r, imageSource: src, mediaId: null, attempts };
+    }
   }
 
   return {
-    ...r,
-    imageSource: link,
+    success: false,
+    httpStatus: 0,
+    raw: `All image send attempts failed :: ${attempts.join(' | ')}`.slice(0, 1500),
+    messageId: null,
+    imageSource: pngLink || rawLink,
     mediaId: null,
-    uploadError: (up && up.error) || null,
+    attempts,
   };
 }
 

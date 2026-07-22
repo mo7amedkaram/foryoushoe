@@ -1049,13 +1049,32 @@ export async function markOrderPending(orderId) {
   }
 }
 
+// Parse Shopify variant_title like "Beige / 37" or "Grey / 39".
+function parseVariantTitle(variantTitle) {
+  const vt = String(variantTitle == null ? '' : variantTitle).trim();
+  if (!vt) return { color: '', size: '' };
+  const parts = vt
+    .split(/\s*\/\s*/)
+    .map((s) => s.trim())
+    .filter(Boolean);
+  if (parts.length >= 2) {
+    const last = parts[parts.length - 1];
+    // Last segment looks like a shoe size → treat as size.
+    if (/^\d{1,2}([.,]\d+)?$/.test(last) || /^\d{2}$/.test(last)) {
+      return { color: parts.slice(0, -1).join(' / '), size: last };
+    }
+    return { color: parts[0], size: parts.slice(1).join(' / ') };
+  }
+  return { color: '', size: vt };
+}
+
 // ------------------------------------------------------------
 //  getOrderItemsDetailed(order) -> [{ qty, title, size, color,
 //  imageUrl }]  (one entry per line item, with the variant image)
 //
-//  Restored from the original working bridge (commit a5d5bad):
 //  Admin API product fetch → variant image → featured → first image.
-//  Only change: normalize protocol-relative CDN URLs to https.
+//  Falls back to public catalog when Admin product read fails (common
+//  cause of missing images on the 2nd+ line item under rate limits).
 // ------------------------------------------------------------
 export async function getOrderItemsDetailed(order) {
   const items = Array.isArray(order && order.line_items)
@@ -1066,11 +1085,20 @@ export async function getOrderItemsDetailed(order) {
   const getProduct = async (pid) => {
     if (!pid) return null;
     if (cache.has(pid)) return cache.get(pid);
-    const res = await adminApiGet(
-      `products/${pid}.json?fields=id,image,images,options,variants`
-    );
-    let p = res && res.ok && res.data ? res.data.product : null;
-    // Fallback if Admin lacks read_products (original path only used Admin).
+    // Prefer full product payload (no fields= filter — some apps return
+    // empty image arrays when fields are restricted).
+    let p = null;
+    const resFull = await adminApiGet(`products/${pid}.json`);
+    if (resFull.ok && resFull.data && resFull.data.product) {
+      p = resFull.data.product;
+    }
+    if (!p) {
+      const res = await adminApiGet(
+        `products/${pid}.json?fields=id,image,images,options,variants,handle`
+      );
+      p = res && res.ok && res.data ? res.data.product : null;
+    }
+    // Public catalog / handle fallback.
     if (!p) {
       p = await fetchProductById(String(pid), '');
     }
@@ -1085,6 +1113,16 @@ export async function getOrderItemsDetailed(order) {
     let size = '';
     let color = '';
     let imageUrl = '';
+
+    // Line-item image fields (rare on REST, common on some payloads).
+    imageUrl =
+      normalizeShopifyImageUrl(
+        (li.image && (li.image.src || li.image.url || li.image)) ||
+          li.image_url ||
+          li.product_image ||
+          ''
+      ) || '';
+
     const p = await getProduct(li.product_id ? String(li.product_id) : '');
     if (p) {
       const opts = Array.isArray(p.options) ? p.options : [];
@@ -1098,20 +1136,36 @@ export async function getOrderItemsDetailed(order) {
         else if (/size|مقاس/i.test(o.name)) size = val;
       }
       const images = Array.isArray(p.images) ? p.images : [];
-      if (v && v.image_id) {
+      if (!imageUrl && v && v.image_id) {
         const vi = images.find((im) => String(im.id) === String(v.image_id));
         if (vi && vi.src) imageUrl = vi.src;
       }
       if (!imageUrl && p.image && p.image.src) imageUrl = p.image.src;
       if (!imageUrl && images[0] && images[0].src) imageUrl = images[0].src;
+      // Sometimes variants list image via featured_image on public JSON.
+      if (!imageUrl && v && v.featured_image && v.featured_image.src) {
+        imageUrl = v.featured_image.src;
+      }
     }
-    if (!size && !color && norm(li.variant_title)) {
-      // last resort label-less
-      size = norm(li.variant_title);
+
+    // Parse "Grey / 39" when product options were unavailable.
+    if ((!size || !color) && norm(li.variant_title)) {
+      const parsed = parseVariantTitle(li.variant_title);
+      if (!color && parsed.color) color = parsed.color;
+      if (!size && parsed.size) size = parsed.size;
+      if (!size && !color) size = norm(li.variant_title);
     }
-    // Original used image.src as-is; Meta needs absolute https.
+
     imageUrl = normalizeShopifyImageUrl(imageUrl) || String(imageUrl || '').trim();
     if (imageUrl && imageUrl.startsWith('//')) imageUrl = 'https:' + imageUrl;
+
+    // Last resort: configured brand fallback so inquiry never drops
+    // the image for a line item that failed product resolution.
+    if (!imageUrl && config.meta.fallbackImage) {
+      imageUrl = normalizeShopifyImageUrl(config.meta.fallbackImage) ||
+        String(config.meta.fallbackImage).trim();
+    }
+
     out.push({ qty, title, size, color, imageUrl });
   }
   return out;

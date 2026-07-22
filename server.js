@@ -2497,20 +2497,42 @@ async function processInboundWhatsAppMessage(msg) {
       if (it.color) parts.push(`اللون : ${it.color}`);
       const caption = `(${i + 1}/${items.length}) ${parts.join(' - ')}`;
       let r;
-      const imageUrl = String(it.imageUrl || '').trim();
+      // Prefer product image; fall back to brand image so multi-item
+      // orders never drop the 2nd+ product image (order #5633 pattern).
+      let imageUrl =
+        toMetaSafeImageUrl(it.imageUrl) ||
+        normalizeImageUrl(it.imageUrl) ||
+        toMetaSafeImageUrl(config.meta.fallbackImage) ||
+        normalizeImageUrl(config.meta.fallbackImage) ||
+        '';
+
       if (imageUrl && /^https?:\/\//i.test(imageUrl)) {
-        // Original: metaSendImage({ to, imageUrl, caption }) — public link.
+        // sendImageMessage: media-upload first (reliable for webp), then link.
         r = await metaSendImage({ to: from, imageUrl, caption });
         if (r && r.success) {
           imagesSent += 1;
         } else {
           console.warn(
-            `[whatsapp-inbound] image fail item ${i + 1}: ${String(
+            `[whatsapp-inbound] image fail item ${i + 1}/${items.length}: ${String(
               (r && r.raw) || ''
-            ).slice(0, 200)}`
+            ).slice(0, 300)}`
           );
-          // Graceful: still deliver details as text.
-          r = await metaSendText({ to: from, text: caption });
+          // One more try with fallback brand image if we used product URL.
+          const fb =
+            toMetaSafeImageUrl(config.meta.fallbackImage) ||
+            normalizeImageUrl(config.meta.fallbackImage) ||
+            '';
+          if (fb && fb !== imageUrl) {
+            r = await metaSendImage({ to: from, imageUrl: fb, caption });
+            if (r && r.success) {
+              imagesSent += 1;
+              imageUrl = fb;
+            }
+          }
+          if (!r || !r.success) {
+            // Last resort: details as text (should be rare now).
+            r = await metaSendText({ to: from, text: caption });
+          }
         }
       } else {
         r = await metaSendText({ to: from, text: caption });
@@ -2519,7 +2541,9 @@ async function processInboundWhatsAppMessage(msg) {
       console.log(
         `[whatsapp-inbound] item ${i + 1}/${items.length} success=${Boolean(
           r && r.success
-        )} msg=${(r && r.messageId) || '-'} image=${Boolean(imageUrl)}`
+        )} msg=${(r && r.messageId) || '-'} image=${Boolean(imageUrl)} media=${
+          (r && r.mediaId) || '-'
+        }`
       );
       await insertLog({
         shopify_order_id: orderId,
@@ -2533,13 +2557,18 @@ async function processInboundWhatsAppMessage(msg) {
           size: it.size,
           color: it.color,
           imageUrl: imageUrl || null,
+          mediaId: (r && r.mediaId) || null,
         },
         success: Boolean(r && r.success),
         response: `[inbound] inquiry item ${i + 1}/${items.length} :: HTTP ${
           (r && r.httpStatus) || 0
-        } :: msg ${(r && r.messageId) || '-'} :: ${String((r && r.raw) || '').slice(0, 400)}`,
+        } :: msg ${(r && r.messageId) || '-'} :: media ${
+          (r && r.mediaId) || '-'
+        } :: ${String((r && r.raw) || '').slice(0, 400)}`,
       });
-      await sleep(250);
+      // Pace free-form messages — Meta is more reliable with a short gap
+      // between multi-item image bursts (2+ products).
+      await sleep(500);
     }
 
     if (items.length > MAX_SEND) {
